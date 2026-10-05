@@ -3,7 +3,6 @@ import unittest
 import numpy as np
 
 from tem_automation.adapters.nion_usim import NionUSimAdapter
-from tem_automation.core.models import AcquisitionSettings
 
 
 class _FakeInstrument:
@@ -50,23 +49,21 @@ class _FakeAPI:
 class NionUSimAdapterTest(unittest.TestCase):
     def test_adapter_translates_si_units_to_usim_frame_parameters(self) -> None:
         api = _FakeAPI()
-        adapter = NionUSimAdapter(api)
+        adapter = NionUSimAdapter(
+            api,
+            fov_nm=80.0,
+            image_size_px=48,
+            dwell_time_us=2.0,
+        )
         adapter.connect()
         adapter.set_defocus(125e-9)
 
-        frame = adapter.acquire(
-            AcquisitionSettings(
-                fov_m=80e-9,
-                width_px=48,
-                height_px=32,
-                dwell_time_s=2e-6,
-            )
-        )
+        image = adapter.acquire_haadf()
 
         self.assertAlmostEqual(api.instrument.controls["C10"], 125e-9)
         self.assertEqual(
             api.hardware_source.last_parameters["pixel_size"],
-            (32, 48),
+            (48, 48),
         )
         self.assertAlmostEqual(
             api.hardware_source.last_parameters["fov_nm"],
@@ -76,7 +73,7 @@ class NionUSimAdapterTest(unittest.TestCase):
             api.hardware_source.last_parameters["pixel_time_us"],
             2.0,
         )
-        self.assertEqual(frame.data.shape, (32, 48))
+        self.assertEqual(image.shape, (32, 48))
 
 
 if __name__ == "__main__":

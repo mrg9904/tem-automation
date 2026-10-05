@@ -1,2 +1,0 @@
-"""Platform-independent automated experiments."""
-

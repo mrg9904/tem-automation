@@ -1,7 +1,7 @@
 import unittest
 
-from tem_automation.core.models import AcquisitionSettings
-from tem_automation.experiments.autofocus import autofocus
+from tem_automation.algorithms.autofocus import AutofocusConfig
+from tem_automation.algorithms.autofocus import autofocus
 from tests.fake_microscope import FakeMicroscope
 
 
@@ -15,10 +15,11 @@ class AutofocusTest(unittest.TestCase):
 
         result = autofocus(
             microscope,
-            AcquisitionSettings(width_px=128, height_px=128),
-            search_half_range_m=300e-9,
-            coarse_points=9,
-            fine_points=7,
+            config=AutofocusConfig(
+                search_half_range_m=300e-9,
+                coarse_points=9,
+                fine_points=7,
+            ),
         )
 
         self.assertAlmostEqual(
@@ -27,7 +28,7 @@ class AutofocusTest(unittest.TestCase):
             delta=30e-9,
         )
         self.assertEqual(
-            microscope.get_state().defocus_m,
+            microscope.get_defocus(),
             result.best_defocus_m,
         )
         self.assertGreaterEqual(len(result.measurements), 13)
@@ -39,13 +40,12 @@ class AutofocusTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             autofocus(
                 microscope,
-                AcquisitionSettings(),
-                coarse_points=8,
+                config=AutofocusConfig(coarse_points=8),
             )
 
     def test_autofocus_restores_original_focus_after_failure(self) -> None:
         class FailingMicroscope(FakeMicroscope):
-            def acquire(self, settings: AcquisitionSettings):
+            def acquire_haadf(self):
                 raise RuntimeError("simulated acquisition failure")
 
         microscope = FailingMicroscope(initial_defocus_m=90e-9)
@@ -54,11 +54,10 @@ class AutofocusTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             autofocus(
                 microscope,
-                AcquisitionSettings(),
-                search_half_range_m=100e-9,
+                config=AutofocusConfig(search_half_range_m=100e-9),
             )
 
-        self.assertAlmostEqual(microscope.get_state().defocus_m, 90e-9)
+        self.assertAlmostEqual(microscope.get_defocus(), 90e-9)
 
 
 if __name__ == "__main__":

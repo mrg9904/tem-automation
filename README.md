@@ -1,10 +1,27 @@
 # TEM Automation
 
-Vendor-independent automation experiments for transmission electron microscopes.
+The runtime code is deliberately divided into only three layers:
 
-The experiment code depends only on the `Microscope` protocol. Vendor-specific
-APIs are isolated in adapters. The first experiment is two-pass HAADF autofocus
-and the first hardware adapter targets Nion uSim.
+```text
+src/tem_automation/
+├── adapters/
+│   ├── base.py
+│   └── nion_usim.py
+├── algorithms/
+│   └── autofocus.py
+└── scripts/
+    └── usim_haadf_autofocus.py
+```
+
+- `adapters`: defines a small vendor-independent microscope API, stores the
+  current acquisition configuration, and translates calls to a vendor API.
+- `algorithms`: owns algorithm-specific defaults and calls only the
+  vendor-independent microscope API.
+- `scripts`: initializes an instrument and lists the high-level experiment
+  actions to execute.
+
+The `tests` directory is development support and is not part of the runtime
+architecture.
 
 ## Install in the Nion Swift development environment
 
@@ -14,7 +31,7 @@ cd /d D:\Development\tem-automation
 python -m pip install -e .
 ```
 
-Run the tests without additional test dependencies:
+## Test
 
 ```bat
 python -m unittest discover -s tests -v
@@ -22,20 +39,11 @@ python -m unittest discover -s tests -v
 
 ## Run in Nion Swift
 
-Start Nion Swift and uSim, open the Python Console, and run:
+Start Nion Swift and uSim, then choose `File > Scripts...` and add:
 
-```python
-from tem_automation.runners.nion_usim_autofocus import run
-
-result = run(
-    search_half_range_nm=200.0,
-    coarse_points=9,
-    fine_points=7,
-    fov_nm=100.0,
-    image_size_px=256,
-    dwell_time_us=1.0,
-)
+```text
+D:\Development\tem-automation\src\tem_automation\scripts\usim_haadf_autofocus.py
 ```
 
-The microscope is left at `result.best_defocus_m` after a successful run. The
-returned result contains every tested defocus and its focus score.
+Double-click the script to run HAADF autofocus. The script contains only the
+instrument initialization and the high-level `autofocus(microscope)` action.

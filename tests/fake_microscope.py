@@ -1,13 +1,6 @@
 from __future__ import annotations
 
-import time
-
 import numpy as np
-
-from tem_automation.core.models import AcquisitionSettings
-from tem_automation.core.models import ImageFrame
-from tem_automation.core.models import MicroscopeState
-
 
 class FakeMicroscope:
     def __init__(
@@ -20,6 +13,7 @@ class FakeMicroscope:
         self.best_defocus_m = best_defocus_m
         self.connected = False
         self._rng = np.random.default_rng(7)
+        self.image_size_px = 128
 
     def connect(self) -> None:
         self.connected = True
@@ -27,14 +21,14 @@ class FakeMicroscope:
     def close(self) -> None:
         self.connected = False
 
-    def get_state(self) -> MicroscopeState:
-        return MicroscopeState(defocus_m=self.defocus_m)
+    def get_defocus(self) -> float:
+        return self.defocus_m
 
     def set_defocus(self, defocus_m: float) -> None:
         self.defocus_m = float(defocus_m)
 
-    def acquire(self, settings: AcquisitionSettings) -> ImageFrame:
-        size = settings.height_px
+    def acquire_haadf(self):
+        size = self.image_size_px
         y, x = np.mgrid[:size, :size]
         specimen = (
             ((x > size * 0.22) & (x < size * 0.48)
@@ -54,13 +48,4 @@ class FakeMicroscope:
         blurred = np.fft.ifft2(np.fft.fft2(specimen) * transfer).real
         noisy = blurred + self._rng.normal(0.0, 0.005, blurred.shape)
 
-        return ImageFrame(
-            data=noisy.astype(np.float32),
-            pixel_size_m=(
-                settings.fov_m / settings.height_px,
-                settings.fov_m / settings.width_px,
-            ),
-            timestamp_s=time.time(),
-            metadata={"adapter": "fake", "defocus_m": self.defocus_m},
-        )
-
+        return noisy.astype(np.float32)

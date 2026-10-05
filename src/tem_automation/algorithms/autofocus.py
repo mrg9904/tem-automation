@@ -7,8 +7,7 @@ from typing import Callable
 import numpy as np
 import numpy.typing as npt
 
-from tem_automation.core.models import AcquisitionSettings
-from tem_automation.core.protocols import Microscope
+from tem_automation.adapters.base import Microscope
 
 
 FocusMetric = Callable[[npt.NDArray[np.float32]], float]
@@ -28,6 +27,20 @@ class AutofocusResult:
     measurements: tuple[FocusMeasurement, ...]
 
 
+@dataclass(frozen=True)
+class AutofocusConfig:
+    """Algorithm parameters kept inside the autofocus layer."""
+
+    search_half_range_m: float = 200e-9
+    coarse_points: int = 9
+    fine_points: int = 7
+    settle_time_s: float = 0.0
+    frames_per_position: int = 1
+
+
+DEFAULT_AUTOFOCUS_CONFIG = AutofocusConfig()
+
+
 def _box_blur_3x3(image: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
     padded = np.pad(image, 1, mode="reflect")
     blurred = np.zeros_like(image)
@@ -41,7 +54,7 @@ def _box_blur_3x3(image: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
 
 
 def tenengrad_score(image: npt.NDArray[np.float32]) -> float:
-    """Return a noise-resistant, intensity-normalized gradient focus score."""
+    """Return a noise-resistant, intensity-normalized focus score."""
     data = np.asarray(image, dtype=np.float64)
     finite = data[np.isfinite(data)]
     if finite.size == 0:
@@ -56,45 +69,37 @@ def tenengrad_score(image: npt.NDArray[np.float32]) -> float:
     smoothed = _box_blur_3x3(normalized)
     gradient_y, gradient_x = np.gradient(smoothed)
     gradient_energy = gradient_x * gradient_x + gradient_y * gradient_y
-
     threshold = np.percentile(gradient_energy, 75.0)
     strong_edges = gradient_energy[gradient_energy >= threshold]
-    if strong_edges.size == 0:
-        return 0.0
-    return float(np.mean(strong_edges))
+    return float(np.mean(strong_edges)) if strong_edges.size else 0.0
 
 
 def autofocus(
     microscope: Microscope,
-    acquisition: AcquisitionSettings,
     *,
-    search_half_range_m: float = 200e-9,
-    coarse_points: int = 9,
-    fine_points: int = 7,
-    settle_time_s: float = 0.0,
-    frames_per_position: int = 1,
+    config: AutofocusConfig = DEFAULT_AUTOFOCUS_CONFIG,
     metric: FocusMetric = tenengrad_score,
 ) -> AutofocusResult:
-    """Run coarse-to-fine HAADF autofocus and leave the best focus applied."""
-    if search_half_range_m <= 0:
+    """Run coarse-to-fine HAADF autofocus and apply the best focus."""
+    if config.search_half_range_m <= 0:
         raise ValueError("search_half_range_m must be positive")
-    if coarse_points < 3 or coarse_points % 2 == 0:
+    if config.coarse_points < 3 or config.coarse_points % 2 == 0:
         raise ValueError("coarse_points must be an odd integer >= 3")
-    if fine_points < 3 or fine_points % 2 == 0:
+    if config.fine_points < 3 or config.fine_points % 2 == 0:
         raise ValueError("fine_points must be an odd integer >= 3")
-    if frames_per_position < 1:
+    if config.frames_per_position < 1:
         raise ValueError("frames_per_position must be at least one")
 
-    original_defocus_m = microscope.get_state().defocus_m
+    original_defocus_m = microscope.get_defocus()
     measurements: list[FocusMeasurement] = []
 
     def evaluate(defocus_m: float) -> FocusMeasurement:
         microscope.set_defocus(float(defocus_m))
-        if settle_time_s > 0:
-            time.sleep(settle_time_s)
+        if config.settle_time_s > 0:
+            time.sleep(config.settle_time_s)
         scores = [
-            metric(microscope.acquire(acquisition).data)
-            for _ in range(frames_per_position)
+            metric(microscope.acquire_haadf())
+            for _ in range(config.frames_per_position)
         ]
         measurement = FocusMeasurement(
             defocus_m=float(defocus_m),
@@ -105,32 +110,27 @@ def autofocus(
 
     try:
         coarse_positions = np.linspace(
-            original_defocus_m - search_half_range_m,
-            original_defocus_m + search_half_range_m,
-            coarse_points,
+            original_defocus_m - config.search_half_range_m,
+            original_defocus_m + config.search_half_range_m,
+            config.coarse_points,
         )
-        coarse_measurements = [evaluate(value) for value in coarse_positions]
-        coarse_best = max(coarse_measurements, key=lambda item: item.score)
+        coarse_results = [evaluate(value) for value in coarse_positions]
+        coarse_best = max(coarse_results, key=lambda item: item.score)
 
         coarse_step_m = float(coarse_positions[1] - coarse_positions[0])
         fine_positions = np.linspace(
             coarse_best.defocus_m - coarse_step_m,
             coarse_best.defocus_m + coarse_step_m,
-            fine_points,
+            config.fine_points,
         )
+        tested = {round(item.defocus_m, 18) for item in measurements}
+        fine_results = [
+            evaluate(float(value))
+            for value in fine_positions
+            if round(float(value), 18) not in tested
+        ]
 
-        tested_positions = {
-            round(item.defocus_m, 18) for item in measurements
-        }
-        fine_measurements = []
-        for value in fine_positions:
-            if round(float(value), 18) not in tested_positions:
-                fine_measurements.append(evaluate(float(value)))
-
-        best = max(
-            coarse_measurements + fine_measurements,
-            key=lambda item: item.score,
-        )
+        best = max(coarse_results + fine_results, key=lambda item: item.score)
         microscope.set_defocus(best.defocus_m)
     except Exception:
         microscope.set_defocus(original_defocus_m)
@@ -142,4 +142,3 @@ def autofocus(
         best_score=best.score,
         measurements=tuple(measurements),
     )
-
