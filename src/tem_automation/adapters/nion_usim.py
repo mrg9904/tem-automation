@@ -81,6 +81,10 @@ class NionUSimAdapter:
                 f"uSim rejected defocus {defocus_m:.6e} m"
             ) from exc
 
+    def get_fov(self) -> float:
+        """Return the acquisition field of view in meters."""
+        return float(self._fov_nm) * 1e-9
+
     def acquire_haadf(self) -> npt.NDArray[np.float32]:
         hardware_source = self._require_hardware_source()
         frame_parameters = (

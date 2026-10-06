@@ -25,6 +25,10 @@ class Microscope(Protocol):
         """Set defocus in meters."""
         ...
 
+    def get_fov(self) -> float:
+        """Return the HAADF field of view in meters."""
+        ...
+
     def acquire_haadf(self) -> npt.NDArray[np.float32]:
         """Acquire and return one 2-D HAADF image."""
         ...
