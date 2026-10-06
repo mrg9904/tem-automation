@@ -1,2 +1,0 @@
-"""Microscope-platform adapters."""
-

@@ -26,7 +26,7 @@ class Microscope(Protocol):
         ...
 
     def get_fov(self) -> float:
-        """Return the HAADF field of view in meters."""
+        """Return the active acquisition field of view in meters."""
         ...
 
     def acquire_haadf(self) -> npt.NDArray[np.float32]:

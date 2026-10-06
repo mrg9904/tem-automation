@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+
 
 class NionUSimAdapter:
     """Nion Swift facade adapter for the uSim STEM scan device."""
@@ -14,14 +16,10 @@ class NionUSimAdapter:
         *,
         instrument_id: str = "usim_stem_controller",
         hardware_source_id: str = "usim_scan_device",
-        profile_index: int = 0,
-        fov_nm: float = 100.0,
         image_size_px: int = 256,
         dwell_time_us: float = 1.0,
         timeout_s: float = 30.0,
     ) -> None:
-        if fov_nm <= 0:
-            raise ValueError("fov_nm must be positive")
         if image_size_px <= 1:
             raise ValueError("image_size_px must exceed one pixel")
         if dwell_time_us <= 0:
@@ -30,8 +28,6 @@ class NionUSimAdapter:
         self._api = api
         self._instrument_id = instrument_id
         self._hardware_source_id = hardware_source_id
-        self._profile_index = profile_index
-        self._fov_nm = fov_nm
         self._image_size_px = image_size_px
         self._dwell_time_us = dwell_time_us
         self._timeout_s = timeout_s
@@ -82,29 +78,40 @@ class NionUSimAdapter:
             ) from exc
 
     def get_fov(self) -> float:
-        """Return the acquisition field of view in meters."""
-        return float(self._fov_nm) * 1e-9
+        """Return the currently selected scan profile FoV in meters."""
+        frame_parameters = self._get_active_profile_frame_parameters()
+        try:
+            fov_nm = float(frame_parameters["fov_nm"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "The active uSim scan profile has no valid FoV"
+            ) from exc
+        if not np.isfinite(fov_nm) or fov_nm <= 0:
+            raise RuntimeError(
+                f"The active uSim scan profile has invalid FoV {fov_nm!r} nm"
+            )
+        return fov_nm * 1e-9
 
     def acquire_haadf(self) -> npt.NDArray[np.float32]:
         hardware_source = self._require_hardware_source()
-        frame_parameters = (
-            hardware_source.get_frame_parameters_for_profile_by_index(
-                self._profile_index
-            )
-        )
+        frame_parameters = self._get_active_profile_frame_parameters()
         frame_parameters["pixel_size"] = (
             self._image_size_px,
             self._image_size_px,
         )
-        frame_parameters["fov_nm"] = self._fov_nm
         frame_parameters["pixel_time_us"] = self._dwell_time_us
 
         try:
+            # Facade.record can return image data slightly before Nion has
+            # completely torn down the previous record task. Wait for the
+            # hardware source to become idle before starting another frame.
+            self._wait_until_recording_finishes(hardware_source)
             frames = hardware_source.record(
                 frame_parameters,
                 None,
                 self._timeout_s,
             )
+            self._wait_until_recording_finishes(hardware_source)
         except Exception as exc:
             raise RuntimeError("uSim HAADF acquisition failed") from exc
 
@@ -118,6 +125,27 @@ class NionUSimAdapter:
                 f"Expected a 2-D HAADF image, received shape {data.shape}"
             )
         return data
+
+    def _get_active_profile_frame_parameters(self) -> dict[str, Any]:
+        """Return a copy of the currently selected scan profile settings."""
+        hardware_source = self._require_hardware_source()
+        profile_index = int(hardware_source.profile_index)
+        return hardware_source.get_frame_parameters_for_profile_by_index(
+            profile_index
+        )
+
+    def _wait_until_recording_finishes(
+        self,
+        hardware_source: Any,
+    ) -> None:
+        """Wait until Nion has completely released its record task."""
+        deadline = time.monotonic() + self._timeout_s
+        while bool(hardware_source.is_recording):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting for the uSim record task to finish"
+                )
+            time.sleep(0.01)
 
     def _require_instrument(self) -> Any:
         if self._instrument is None:

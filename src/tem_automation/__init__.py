@@ -1,1 +1,0 @@
-"""Vendor-independent TEM automation."""

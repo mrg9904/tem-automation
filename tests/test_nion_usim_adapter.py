@@ -25,9 +25,12 @@ class _FakeXData:
 class _FakeHardwareSource:
     def __init__(self) -> None:
         self.last_parameters = None
+        self.current_parameters = {
+            "fov_nm": 80.0,
+        }
 
-    def get_frame_parameters_for_profile_by_index(self, index: int):
-        return {"profile_index": index}
+    def get_frame_parameters(self):
+        return dict(self.current_parameters)
 
     def record(self, frame_parameters, channels_enabled, timeout):
         self.last_parameters = frame_parameters
@@ -50,11 +53,10 @@ class NionUSimAdapterTest(unittest.TestCase):
     def test_adapter_translates_si_units_to_usim_frame_parameters(self) -> None:
         api = _FakeAPI()
         adapter = NionUSimAdapter(
-            api,
-            fov_nm=80.0,
-            image_size_px=48,
-            dwell_time_us=2.0,
-        )
+        api,
+        image_size_px=48,
+        dwell_time_us=2.0,
+    )
         adapter.connect()
         adapter.set_defocus(125e-9)
 

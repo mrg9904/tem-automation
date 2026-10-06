@@ -1,2 +1,0 @@
-"""Vendor-independent automation algorithms."""
-
