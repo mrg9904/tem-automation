@@ -27,6 +27,9 @@ class FakeMicroscope:
     def set_defocus(self, defocus_m: float) -> None:
         self.defocus_m = float(defocus_m)
 
+    def get_fov(self) -> float:
+        return 100e-9
+
     def acquire_haadf(self):
         size = self.image_size_px
         y, x = np.mgrid[:size, :size]

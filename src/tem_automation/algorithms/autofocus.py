@@ -36,7 +36,8 @@ class AutofocusConfig:
     """Algorithm parameters kept inside the autofocus layer."""
 
     precision_fov_fraction: float = 1.0 / 100.0
-    initial_half_range_fov_fraction: float = 2.0
+    # Total initial search width is twice the active FoV: center +/- FoV.
+    initial_half_range_fov_fraction: float = 1.0
     points_per_round: int = 7
     max_rounds: int = 12
     settle_time_s: float = 0.0
@@ -172,7 +173,11 @@ def autofocus(
                 break
 
             center_m = best.defocus_m
-            if not best_is_at_boundary:
+            if best_is_at_boundary:
+                # A boundary maximum does not bracket the focus peak.
+                # Expand towards it before attempting finer sampling.
+                half_range_m *= 2.0
+            else:
                 half_range_m = final_step_m
 
         if best is None:

@@ -47,3 +47,11 @@ D:\Development\tem-automation\src\tem_automation\scripts\usim_haadf_autofocus.py
 
 Double-click the script to run HAADF autofocus. The script contains only the
 instrument initialization and the high-level `autofocus(microscope)` action.
+
+Autofocus initially searches the current defocus +/- one active profile FoV
+(a total width of twice the FoV). If the highest focus score lies at either
+endpoint, it centers on that endpoint and doubles the half-range until a
+peak is bracketed. It then refines to 1% of the FoV. The default 12-round
+budget bounds both expansion and refinement; an unbracketed search reports
+`converged=False` and retains the best measured focus. Acquisition failures
+restore the original defocus.

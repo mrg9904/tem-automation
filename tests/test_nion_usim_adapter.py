@@ -25,11 +25,13 @@ class _FakeXData:
 class _FakeHardwareSource:
     def __init__(self) -> None:
         self.last_parameters = None
+        self.profile_index = 0
+        self.is_recording = False
         self.current_parameters = {
             "fov_nm": 80.0,
         }
 
-    def get_frame_parameters(self):
+    def get_frame_parameters_for_profile_by_index(self, profile_index):
         return dict(self.current_parameters)
 
     def record(self, frame_parameters, channels_enabled, timeout):
@@ -58,6 +60,7 @@ class NionUSimAdapterTest(unittest.TestCase):
         dwell_time_us=2.0,
     )
         adapter.connect()
+        self.assertAlmostEqual(adapter.get_fov(), 80e-9)
         adapter.set_defocus(125e-9)
 
         image = adapter.acquire_haadf()
