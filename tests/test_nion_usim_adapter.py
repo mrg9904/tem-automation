@@ -7,7 +7,7 @@ from adapters.nion_usim import NionUSimAdapter
 
 class _FakeInstrument:
     def __init__(self) -> None:
-        self.controls = {"C10": 50e-9}
+        self.controls = {"C10": 50e-9, "stage_position_m.x": 1222e-9, "stage_position_m.y": 279e-9}
 
     def get_control_output(self, name: str) -> float:
         return self.controls[name]
@@ -33,6 +33,10 @@ class _FakeHardwareSource:
 
     def get_frame_parameters_for_profile_by_index(self, profile_index):
         return dict(self.current_parameters)
+
+    def set_frame_parameters_for_profile_by_index(self, profile_index, frame_parameters):
+        self.last_profile_index = profile_index
+        self.current_parameters = dict(frame_parameters)
 
     def record(self, frame_parameters, channels_enabled, timeout):
         self.last_parameters = frame_parameters
@@ -79,6 +83,29 @@ class NionUSimAdapterTest(unittest.TestCase):
             2.0,
         )
         self.assertEqual(image.shape, (32, 48))
+
+
+    def test_zoom_updates_selected_profile_preserving_parameters_and_focus(self):
+        from algorithms.Zoom2Fit import zoom_to_fit
+        api = _FakeAPI()
+        api.hardware_source.profile_index = 1
+        api.hardware_source.current_parameters.update(rotation_rad=0.0, pixel_time_us=3.0)
+        with NionUSimAdapter(api) as microscope:
+            result = zoom_to_fit(microscope, (100e-9, -50e-9), 200e-9)
+            np.testing.assert_allclose(microscope.get_stage_position(), (1122e-9, 329e-9))
+            self.assertAlmostEqual(result.actual_fov_m, 200e-9, delta=1e-18)
+            self.assertEqual(microscope.get_defocus(), 50e-9)
+            self.assertEqual(api.hardware_source.last_profile_index, 1)
+            self.assertEqual(api.hardware_source.current_parameters['pixel_time_us'], 3.0)
+            microscope.acquire_haadf()
+            self.assertAlmostEqual(api.hardware_source.last_parameters['fov_nm'], 200.0)
+
+    def test_centering_applies_scan_rotation(self):
+        api = _FakeAPI()
+        api.hardware_source.current_parameters['rotation_rad'] = np.pi / 2
+        with NionUSimAdapter(api) as microscope:
+            microscope.center_fov_on_image_offset(100e-9, 0.0)
+            np.testing.assert_allclose(microscope.get_stage_position(), (1222e-9, 179e-9))
 
 
 if __name__ == "__main__":

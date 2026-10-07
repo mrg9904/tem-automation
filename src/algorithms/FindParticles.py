@@ -1,4 +1,4 @@
-"""Index separated particles in a HAADF field of view and save NumPy arrays.
+"""Find separated particles in a HAADF field of view and save NumPy arrays.
 
 Coordinates use pixel centers (x=column, y=row). Offsets are image-axis
 coordinates relative to the FoV center, not absolute stage coordinates.
@@ -23,12 +23,14 @@ PARTICLE_DTYPE = np.dtype([
     ("offset_x_m", "<f8"),
     ("offset_y_m", "<f8"),
     ("area_px", "<i8"),
+    ("circle_diameter_px", "<f8"),
+    ("circle_diameter_m", "<f8"),
     ("touches_edge", "?"),
 ])
 
 
 @dataclass(frozen=True)
-class IndexParticlesConfig:
+class FindParticlesConfig:
     """Threshold applies after smoothing; None selects an Otsu threshold."""
 
     gaussian_sigma_px: float = 1.0
@@ -39,13 +41,13 @@ class IndexParticlesConfig:
 
 
 @dataclass(frozen=True)
-class IndexParticlesResult:
+class FindParticlesResult:
     particles: np.ndarray
     labels: npt.NDArray[np.int32]
     image: npt.NDArray[np.float32]
     fov_m: float
     threshold: float
-    config: IndexParticlesConfig
+    config: FindParticlesConfig
 
     def save(self, path: str | Path) -> Path:
         """Save a versioned archive that loads with allow_pickle=False.
@@ -58,7 +60,7 @@ class IndexParticlesResult:
         with path.open("wb") as stream:
             np.savez_compressed(
                 stream,
-                schema_version=np.int32(1),
+                schema_version=np.int32(2),
                 particles=self.particles,
                 labels=self.labels,
                 image=self.image,
@@ -91,19 +93,15 @@ class IndexParticlesResult:
             pixels = np.zeros(self.image.shape, dtype=np.uint8)
         raw = Image.fromarray(pixels)
         raw_path = directory / "haadf.png"
-        annotated_path = directory / "haadf_indexed.png"
+        annotated_path = directory / "haadf_annotated.png"
         raw.save(raw_path)
         annotated = raw.convert("RGB")
         draw = ImageDraw.Draw(annotated)
         font = ImageFont.load_default(size=14)
-        regions = ndimage.find_objects(self.labels)
         for particle in self.particles:
             particle_id = int(particle["id"])
             x, y = float(particle["center_x_px"]), float(particle["center_y_px"])
-            region = regions[particle_id - 1]
-            local_y, local_x = np.nonzero(self.labels[region] == particle_id)
-            distances = np.hypot(local_x + region[1].start - x, local_y + region[0].start - y)
-            radius = max(4.0, float(distances.max()) + 1.0)
+            radius = float(particle["circle_diameter_px"]) / 2.0
             draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=(0, 255, 0), width=2)
             draw.line((x - 4, y, x + 4, y), fill=(0, 255, 255), width=1)
             draw.line((x, y - 4, x, y + 4), fill=(0, 255, 255), width=1)
@@ -132,12 +130,12 @@ def _otsu_threshold(image: np.ndarray) -> float:
     return float(edges[int(np.argmax(variance)) + 1])
 
 
-def index_particles_in_image(
+def find_particles_in_image(
     image: npt.ArrayLike,
     *,
     fov_m: float,
-    config: IndexParticlesConfig = IndexParticlesConfig(),
-) -> IndexParticlesResult:
+    config: FindParticlesConfig = FindParticlesConfig(),
+) -> FindParticlesResult:
     """Segment particles using Gaussian smoothing and 8-connected regions.
 
     FoV is the image's longest-side extent in meters, with square pixels.
@@ -176,29 +174,35 @@ def index_particles_in_image(
     mapping = np.zeros(count + 1, dtype=np.int32)
     height, width = image.shape
     pixel_size_m = fov_m / max(height, width)
+    regions = ndimage.find_objects(components)
     for particle_id, (component_id, (y, x)) in enumerate(ordered, start=1):
         mapping[component_id] = particle_id
+        region = regions[component_id - 1]
+        local_y, local_x = np.nonzero(components[region] == component_id)
+        distances = np.hypot(local_x + region[1].start - x, local_y + region[0].start - y)
+        diameter_px = 2.0 * max(4.0, float(distances.max()) + 1.0)
         particles[particle_id - 1] = (
             particle_id, x, y,
             (x + 0.5 - width / 2) * pixel_size_m,
             (y + 0.5 - height / 2) * pixel_size_m,
-            areas[component_id], component_id in edge_ids,
+            areas[component_id], diameter_px, diameter_px * pixel_size_m,
+            component_id in edge_ids,
         )
-    return IndexParticlesResult(particles, mapping[components], image, float(fov_m), float(threshold), config)
+    return FindParticlesResult(particles, mapping[components], image, float(fov_m), float(threshold), config)
 
 
-def index_particles(
+def find_particles(
     microscope: Microscope,
     *,
-    output_path: str | Path = "index_particles.npz",
-    config: IndexParticlesConfig = IndexParticlesConfig(),
-) -> IndexParticlesResult:
-    """Acquire the current FoV once, index its particles, and save the result.
+    output_path: str | Path = "find_particles.npz",
+    config: FindParticlesConfig = FindParticlesConfig(),
+) -> FindParticlesResult:
+    """Acquire the current FoV once, find its particles, and save the result.
 
     This action does not change focus or stage position. IDs are local to
     this acquisition; it does not track particles between acquisitions.
     """
     fov_m = microscope.get_fov()
-    result = index_particles_in_image(microscope.acquire_haadf(), fov_m=fov_m, config=config)
+    result = find_particles_in_image(microscope.acquire_haadf(), fov_m=fov_m, config=config)
     result.save(output_path)
     return result

@@ -92,6 +92,43 @@ class NionUSimAdapter:
             )
         return fov_nm * 1e-9
 
+    def set_fov(self, fov_m: float) -> None:
+        """Persist FoV in the selected scan profile, preserving other settings."""
+        if not np.isfinite(fov_m) or fov_m <= 0:
+            raise ValueError("fov_m must be finite and positive")
+        source = self._require_hardware_source()
+        self._wait_until_recording_finishes(source)
+        profile_index = int(source.profile_index)
+        parameters = dict(source.get_frame_parameters_for_profile_by_index(profile_index))
+        parameters["fov_nm"] = float(fov_m) * 1e9
+        source.set_frame_parameters_for_profile_by_index(profile_index, parameters)
+
+    def get_stage_position(self) -> tuple[float, float]:
+        instrument = self._require_instrument()
+        return (float(instrument.get_control_output("stage_position_m.x")),
+                float(instrument.get_control_output("stage_position_m.y")))
+
+    def set_stage_position(self, x_m: float, y_m: float) -> None:
+        if not np.all(np.isfinite([x_m, y_m])):
+            raise ValueError("Stage coordinates must be finite")
+        instrument = self._require_instrument()
+        instrument.set_control_output("stage_position_m.x", float(x_m))
+        instrument.set_control_output("stage_position_m.y", float(y_m))
+
+    def center_fov_on_image_offset(self, x_m: float, y_m: float) -> None:
+        """Match uSim's double-click centering, including scan rotation."""
+        if not np.all(np.isfinite([x_m, y_m])):
+            raise ValueError("Image offsets must be finite")
+        parameters = self._get_active_profile_frame_parameters()
+        rotation = float(parameters.get("rotation_rad", 0.0))
+        if not np.isfinite(rotation):
+            raise RuntimeError("Scan rotation must be finite")
+        cos_angle, sin_angle = np.cos(rotation), np.sin(rotation)
+        delta_x = cos_angle * x_m - sin_angle * y_m
+        delta_y = sin_angle * x_m + cos_angle * y_m
+        stage_x, stage_y = self.get_stage_position()
+        self.set_stage_position(stage_x - delta_x, stage_y - delta_y)
+
     def acquire_haadf(self) -> npt.NDArray[np.float32]:
         hardware_source = self._require_hardware_source()
         frame_parameters = self._get_active_profile_frame_parameters()

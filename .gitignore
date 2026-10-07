@@ -10,4 +10,9 @@ autofocus-results/
 
 
 # Generated particle arrays and HAADF images.
+src/scripts/find_particles_results/
+
+src/scripts/particle_workflow_results/
+
+# Historical output generated before the FindParticles rename.
 src/scripts/index_particles_results/
