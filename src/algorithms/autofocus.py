@@ -7,7 +7,7 @@ from typing import Callable
 import numpy as np
 import numpy.typing as npt
 
-from tem_automation.adapters.base import Microscope
+from adapters.base import Microscope
 
 
 FocusMetric = Callable[[npt.NDArray[np.float32]], float]

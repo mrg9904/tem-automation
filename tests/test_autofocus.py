@@ -2,8 +2,8 @@ import unittest
 
 import numpy as np
 
-from tem_automation.algorithms.autofocus import AutofocusConfig
-from tem_automation.algorithms.autofocus import autofocus
+from algorithms.autofocus import AutofocusConfig
+from algorithms.autofocus import autofocus
 from tests.fake_microscope import FakeMicroscope
 
 

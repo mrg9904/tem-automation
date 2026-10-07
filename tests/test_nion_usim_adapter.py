@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from tem_automation.adapters.nion_usim import NionUSimAdapter
+from adapters.nion_usim import NionUSimAdapter
 
 
 class _FakeInstrument:

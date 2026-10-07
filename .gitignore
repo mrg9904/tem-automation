@@ -8,3 +8,6 @@ dist/
 build/
 autofocus-results/
 
+
+# Generated particle arrays and HAADF images.
+src/scripts/index_particles_results/

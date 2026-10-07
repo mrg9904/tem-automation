@@ -1,5 +1,5 @@
-from tem_automation.adapters.nion_usim import NionUSimAdapter
-from tem_automation.algorithms.autofocus import autofocus
+from adapters.nion_usim import NionUSimAdapter
+from algorithms.autofocus import autofocus
 
 def script_main(api_broker):
     """Entry point called automatically by Nion Swift."""
