@@ -85,3 +85,45 @@ class FindEdgeTest(unittest.TestCase):
         right = np.where(centers[:,0] == 79.5)[0]
         left = np.where(centers[:,0] == 19.5)[0]
         self.assertLess(right.min(), left.max())
+
+    def test_sparse_edge_centered_rectangle_avoids_paired_boxes(self):
+        image = np.zeros((120, 220))
+        image[30:90, 30:190] = 10
+        result = find_edge_in_image(image, fov_m=220e-9, box_fov_m=20e-9,
+            config=FindEdgeConfig(particles=self.config.particles))
+        self.assertLessEqual(len(result.boxes), 24)
+        centers = np.c_[result.boxes['center_x_px'], result.boxes['center_y_px']]
+        overlap = np.prod(np.maximum(0, 20 - np.abs(centers[:, None] - centers[None, :])), axis=2) / 400
+        np.fill_diagonal(overlap, 0)
+        self.assertLess(overlap.max(axis=1).mean(), .15)
+
+    def test_curved_concave_and_separate_contours_have_complete_coverage(self):
+        yy, xx = np.indices((160, 160))
+        circle = (xx - 70)**2 + (yy - 75)**2 < 45**2
+        concave = circle & ~((xx > 65) & (yy > 65) & (yy < 85))
+        separate = np.zeros((160, 160), dtype=bool)
+        separate[10:25, 130:145] = True
+        for mask in (circle, concave, circle | separate):
+            with self.subTest(area=int(mask.sum())):
+                result = find_edge_in_image(mask.astype(float) * 10,
+                    fov_m=160e-9, box_fov_m=15e-9,
+                    config=FindEdgeConfig(particles=self.config.particles))
+                centers = np.c_[result.boxes['center_x_px'], result.boxes['center_y_px']]
+                samples = []
+                for first, last in zip(result.contour_offsets[:-1], result.contour_offsets[1:]):
+                    loop = result.edge_points_px[first:last]
+                    samples.extend((loop, (loop[:-1] + loop[1:]) / 2))
+                samples = np.concatenate(samples)
+                distances = np.max(np.abs(samples[:, None] - centers), axis=2)
+                self.assertTrue(np.all(distances.min(axis=1) <= 7.5 + 1e-9))
+                self.assertTrue(np.all(distances.min(axis=0) < 1e-9))
+                for first, last in zip(result.contour_offsets[:-1], result.contour_offsets[1:]):
+                    loop = result.edge_points_px[first:last]
+                    path = np.empty((2 * (len(loop) - 1) + 1, 2))
+                    path[::2] = loop
+                    path[1::2] = (loop[:-1] + loop[1:]) / 2
+                    inside = np.max(np.abs(path[:, None] - centers), axis=2) <= 7.5 + 1e-9
+                    self.assertTrue(np.all(np.any(inside[:-1] & inside[1:], axis=1)))
+                for identifier in np.unique(result.boxes['contour_id']):
+                    arc = result.boxes['arc_length_px'][result.boxes['contour_id'] == identifier]
+                    self.assertTrue(np.all(np.diff(arc) >= 0))

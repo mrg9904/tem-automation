@@ -30,14 +30,12 @@ def cancellation_scope(callback):
 
 @contextmanager
 def suspend_cancellation():
-    with cancellation_scope(None):
-        yield
-
-
-def nion_cancel_callback(print_function):
-    # ScriptsDialog supplies its bound print method to the executed script.
-    dialog = getattr(print_function, "__self__", None)
-    return lambda: bool(getattr(dialog, "cancelled", False) or getattr(dialog, "_RunScriptDialog__is_closed", False))
+    previous = set_stop_file(None)
+    try:
+        with cancellation_scope(None):
+            yield
+    finally:
+        set_stop_file(previous)
 
 
 def set_stop_file(path):

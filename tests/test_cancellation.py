@@ -43,7 +43,7 @@ class CancellationTest(unittest.TestCase):
 
     def test_cancel_workflow_is_not_swallowed_by_continue_on_error(self):
         microscope = edge_fixtures.EdgeMicroscope()
-        with tempfile.TemporaryDirectory() as root, mock.patch('scripts.usim_particle_workflow.autofocus', side_effect=WorkflowCancelled('stop')), mock.patch('builtins.print'):
+        with tempfile.TemporaryDirectory() as root, mock.patch('scripts.common.autofocus', side_effect=WorkflowCancelled('stop')), mock.patch('builtins.print'):
             with self.assertRaises(WorkflowCancelled):
                 run_particle_edge_workflow(microscope, root, config=edge_fixtures.ParticleEdgeWorkflowTest.config)
             report = json.loads((next(Path(root).iterdir()) / 'run.json').read_text())

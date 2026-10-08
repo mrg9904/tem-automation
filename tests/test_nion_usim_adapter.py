@@ -128,6 +128,20 @@ class NionUSimAdapterTest(unittest.TestCase):
             zoom_to_fit(microscope, (100e-9, 50e-9), 50e-9, reference_stage_position_m=reference)
             np.testing.assert_allclose(microscope.get_stage_position(), (1272e-9, 179e-9))
 
+    def test_final_capture_profile_survives_temporary_settings_and_later_focus_scan(self):
+        api = _FakeAPI()
+        with NionUSimAdapter(api, image_size_px=512) as microscope:
+            with microscope.acquisition_settings(image_size_px=1024, dwell_time_us=1.):
+                microscope.set_fov(50e-9)
+                microscope.acquire_haadf()
+            final = microscope.get_last_scan_profile()
+            microscope.set_fov(800e-9)
+            microscope.acquire_haadf()
+            microscope.persist_last_scan_profile(final)
+            self.assertEqual(api.hardware_source.current_parameters['pixel_size'],(1024,1024))
+            self.assertAlmostEqual(api.hardware_source.current_parameters['fov_nm'],50.)
+            self.assertEqual(api.hardware_source.current_parameters['pixel_time_us'],1.)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,3 +20,9 @@ src/scripts/index_particles_results/
 tests/find_edge_results/
 
 src/scripts/particle_edge_workflow_results/
+
+tests/edge_review_results/
+src/scripts/find_roi_results/
+src/scripts/roi_reference.npz
+
+src/scripts/roi_reference.json

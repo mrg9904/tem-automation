@@ -28,12 +28,12 @@ class EdgeMicroscope(WorkflowMicroscope):
 
 class ParticleEdgeWorkflowTest(unittest.TestCase):
     detection = FindParticlesConfig(gaussian_sigma_px=0, min_area_px=1)
-    config = workflow.ParticleEdgeWorkflowConfig(finding=detection,
+    config = workflow.ParticleEdgeWorkflowConfig(particle_id=1, preserve_last_scan=False, finding=detection,
              edges=FindEdgeConfig(particles=detection))
 
     def test_real_find_edge_and_every_box_has_50nm_capture_without_accumulation(self):
         microscope = EdgeMicroscope()
-        with tempfile.TemporaryDirectory() as root, mock.patch('scripts.usim_particle_workflow.autofocus', side_effect=focus_result), mock.patch('builtins.print'):
+        with tempfile.TemporaryDirectory() as root, mock.patch('scripts.common.autofocus', side_effect=focus_result), mock.patch('builtins.print'):
             run = workflow.run_particle_edge_workflow(microscope, root, config=self.config)
             report = json.loads((run / 'run.json').read_text())
             self.assertEqual(report['status'], 'completed')
@@ -66,7 +66,7 @@ class ParticleEdgeWorkflowTest(unittest.TestCase):
             if count == 1:
                 raise RuntimeError('edge focus failed')
             return focus_result(microscope, config)
-        with tempfile.TemporaryDirectory() as root, mock.patch('scripts.usim_particle_workflow.autofocus', side_effect=fail_first), mock.patch('builtins.print'):
+        with tempfile.TemporaryDirectory() as root, mock.patch('scripts.common.autofocus', side_effect=fail_first), mock.patch('builtins.print'):
             run = workflow.run_particle_edge_workflow(microscope, root, config=self.config)
             report = json.loads((run / 'run.json').read_text())
             self.assertEqual(report['status'], 'completed_with_errors')
@@ -89,11 +89,13 @@ class ParticleEdgeWorkflowTest(unittest.TestCase):
         microscope = EdgeMicroscope()
         with tempfile.TemporaryDirectory() as root, mock.patch.object(scripts, '__file__', str(Path(root) / '__init__.py')), \
              mock.patch('adapters.nion_usim.NionUSimAdapter') as adapter, \
-             mock.patch('scripts.usim_particle_workflow.autofocus', side_effect=focus_result), mock.patch('builtins.print'):
+             mock.patch('scripts.common.autofocus', side_effect=focus_result), mock.patch('builtins.print'):
             adapter.return_value.__enter__.return_value = microscope
+            original_is_file = Path.is_file
             namespace = {}
             exec(compile(source, 'nion_edge_workflow', 'exec'), namespace)
-            namespace['script_main'](mock.Mock())
+            with mock.patch.object(namespace['ROIReferenceBank'], 'load', return_value=mock.Mock(threshold=0.1)), mock.patch.object(namespace['Path'], 'is_file', autospec=True, side_effect=lambda path: path.name == 'roi_reference.npz' or original_is_file(path)), mock.patch.dict(namespace, {'run_particle_edge_workflow': lambda microscope, root, **kwargs: workflow.run_particle_edge_workflow(microscope, root, config=self.config)}):
+                namespace['script_main'](mock.Mock())
             run = next((Path(root) / 'particle_edge_workflow_results').iterdir())
             report = json.loads((run / 'run.json').read_text())
             self.assertGreater(report['box_count'], 0)
@@ -101,9 +103,69 @@ class ParticleEdgeWorkflowTest(unittest.TestCase):
 
     def test_no_reference_return_between_edge_boxes(self):
         microscope = EdgeMicroscope()
-        with tempfile.TemporaryDirectory() as root, mock.patch('scripts.usim_particle_workflow.autofocus', side_effect=focus_result), \
-             mock.patch.object(workflow, '_restore_state', wraps=workflow._restore_state) as restore, mock.patch('builtins.print'):
+        with tempfile.TemporaryDirectory() as root, mock.patch('scripts.common.autofocus', side_effect=focus_result), \
+             mock.patch('scripts.common.restore_state', wraps=__import__('scripts.common',fromlist=['restore_state']).restore_state) as restore, mock.patch('builtins.print'):
             run = workflow.run_particle_edge_workflow(microscope, root, config=self.config)
             report = json.loads((run / 'run.json').read_text())
             self.assertGreater(report['box_count'], 1)
             self.assertEqual(restore.call_count, 1)  # Only final restoration to the initial overview.
+
+    def test_particle_two_roi_uses_saved_capture_and_records_locations(self):
+        from dataclasses import replace
+        from algorithms.FindROI import ROIReferenceBank
+        microscope = EdgeMicroscope()
+        sample = microscope.acquire_haadf()
+        bank = ROIReferenceBank().fit([(sample, 50e-9)])
+        bank.calibrate([(sample, 50e-9)])
+        with tempfile.TemporaryDirectory() as root, mock.patch('scripts.common.autofocus', side_effect=focus_result), mock.patch('builtins.print'):
+            run = workflow.run_particle_edge_workflow(microscope, root,
+                config=replace(self.config, particle_id=2), roi_reference=bank)
+            report = json.loads((run / 'run.json').read_text())
+            self.assertEqual(report['particle_id'], 2)
+            self.assertEqual(report['mosaic']['status'], 'completed')
+            self.assertTrue((run / 'particle_0002/mosaic/haadf_mosaic_roi.png').is_file())
+            self.assertEqual(report['roi_reference']['model_id'], bank.model_id)
+            self.assertTrue((run / 'particle_0002').is_dir())
+            self.assertTrue(any(entry['roi_count'] > 0 for entry in report['boxes']))
+            for entry in report['boxes']:
+                self.assertEqual(entry['status'], 'captured')
+                self.assertEqual(entry['roi_status'], 'completed')
+                directory = run / entry['directory']
+                self.assertTrue((directory / 'roi/haadf_roi.png').is_file())
+                positions = json.loads((directory / 'roi/roi_positions.json').read_text())
+                self.assertEqual(positions['particle_id'], 2)
+                self.assertEqual(positions['capture_state'], entry['capture_state'])
+                with np.load(directory / 'haadf.npz') as capture:
+                    self.assertEqual(int(capture['particle_id']), 2)
+            np.testing.assert_allclose(report['particle_view_state']['stage_position_m'], [1067e-9,124e-9])
+
+    def test_missing_selected_particle_aborts_before_zoom_and_restores(self):
+        from dataclasses import replace
+        microscope = EdgeMicroscope()
+        config = replace(self.config, particle_id=3)
+        with tempfile.TemporaryDirectory() as root, mock.patch('builtins.print'):
+            with self.assertRaisesRegex(RuntimeError, 'Particle #3 not found'):
+                workflow.run_particle_edge_workflow(microscope, root, config=config)
+            report = json.loads((next(Path(root).iterdir()) / 'run.json').read_text())
+            self.assertEqual(report['status'], 'aborted')
+            self.assertTrue(report['state_restored'])
+            self.assertEqual(report['box_count'], 0)
+
+    def test_completed_run_preserves_last_capture_and_warns_on_unconverged_focus(self):
+        from dataclasses import replace
+        microscope = EdgeMicroscope()
+        def unconverged(microscope, config):
+            return replace(focus_result(microscope, config), converged=False, stop_reason='low_score_confidence')
+        with tempfile.TemporaryDirectory() as root, mock.patch('scripts.common.autofocus', side_effect=unconverged), mock.patch('builtins.print') as output:
+            run = workflow.run_particle_edge_workflow(microscope, root,
+                config=replace(self.config,preserve_last_scan=True))
+            report = json.loads((run/'run.json').read_text())
+            last=report['boxes'][-1]['capture_state']
+            self.assertTrue(report['last_scan_preserved'])
+            np.testing.assert_allclose(microscope.stage,last['stage_position_m'])
+            self.assertAlmostEqual(microscope.fov,last['fov_m'])
+            self.assertAlmostEqual(microscope.focus,last['defocus_m'])
+            self.assertTrue(all(entry['autofocus_retried'] for entry in report['boxes']))
+            self.assertTrue(any(str(call.args[0]).startswith('***Warning***') for call in output.call_args_list))
+            self.assertIn('#b65b00',(run/'workflow_messages.html').read_text())
+            self.assertTrue((run/report['boxes'][-1]['directory']/'autofocus_initial.json').is_file())

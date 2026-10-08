@@ -137,6 +137,16 @@ class AutofocusTest(unittest.TestCase):
         self.assertAlmostEqual(result.best_defocus_m, 130e-9, delta=5e-9)
         self.assertLessEqual(calls, 25)
 
+    def test_small_noisy_interior_peak_is_not_reported_as_converged(self):
+        microscope = FakeMicroscope(initial_defocus_m=140e-9)
+        values = iter([1.,1.006,1.004,1.003,1.002])
+        result = autofocus(microscope, config=AutofocusConfig(points_per_round=5,
+            frames_per_position=1, minimum_score_span_fraction=.02),
+            metric=lambda image: next(values))
+        self.assertFalse(result.converged)
+        self.assertEqual(result.stop_reason,'low_score_confidence')
+        self.assertEqual(result.rounds,1)
+
 
 if __name__ == "__main__":
     unittest.main()

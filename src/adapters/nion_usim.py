@@ -6,6 +6,7 @@ from contextlib import contextmanager
 
 from adapters.cancellation import check_cancelled, suspend_cancellation
 from typing import Any
+from adapters.coordinates import ImageStageTransform
 
 import numpy as np
 import numpy.typing as npt
@@ -131,21 +132,44 @@ class NionUSimAdapter:
         instrument.set_control_output("stage_position_m.x", float(x_m))
         instrument.set_control_output("stage_position_m.y", float(y_m))
 
+    def get_last_scan_profile(self):
+        parameters = getattr(self, '_last_record_parameters', None)
+        return None if parameters is None else {'profile_index': self._last_record_profile_index,
+                                                'parameters': dict(parameters)}
+
+    def persist_last_scan_profile(self, snapshot=None):
+        """Apply the last successful record parameters to the live scan profile."""
+        snapshot = self.get_last_scan_profile() if snapshot is None else snapshot
+        if snapshot is None:
+            return None
+        parameters = snapshot['parameters']
+        source = self._require_hardware_source()
+        self._wait_until_recording_finishes(source)
+        index = snapshot['profile_index']
+        source.set_frame_parameters_for_profile_by_index(index, dict(parameters))
+        source.profile_index = index
+        # Keep adapter settings consistent for any subsequent manual/script capture.
+        self._image_size_px = int(parameters['pixel_size'][0])
+        self._dwell_time_us = float(parameters['pixel_time_us'])
+        return {'profile_index': index, 'parameters': dict(parameters)}
+
+    def get_coordinate_transform(self):
+        return ImageStageTransform(self.get_scan_rotation(), stage_direction=-1.)
+
+    def get_scan_rotation(self) -> float:
+        rotation = float(self._get_active_profile_frame_parameters().get("rotation_rad", 0.0))
+        if not np.isfinite(rotation):
+            raise RuntimeError("Scan rotation must be finite")
+        return rotation
+
     def center_fov_on_image_offset(self, x_m: float, y_m: float, *,
                                    reference_stage_position_m: tuple[float, float] | None = None) -> None:
         """Match uSim's double-click centering, including scan rotation."""
         if not np.all(np.isfinite([x_m, y_m])):
             raise ValueError("Image offsets must be finite")
-        parameters = self._get_active_profile_frame_parameters()
-        rotation = float(parameters.get("rotation_rad", 0.0))
-        if not np.isfinite(rotation):
-            raise RuntimeError("Scan rotation must be finite")
-        cos_angle, sin_angle = np.cos(rotation), np.sin(rotation)
-        delta_x = cos_angle * x_m - sin_angle * y_m
-        delta_y = sin_angle * x_m + cos_angle * y_m
-        stage_x, stage_y = (self.get_stage_position() if reference_stage_position_m is None
-                            else reference_stage_position_m)
-        self.set_stage_position(stage_x - delta_x, stage_y - delta_y)
+        reference = self.get_stage_position() if reference_stage_position_m is None else reference_stage_position_m
+        target = self.get_coordinate_transform().stage_position_for_offset((x_m,y_m),reference)
+        self.set_stage_position(*target)
 
     def acquire_haadf(self) -> npt.NDArray[np.float32]:
         hardware_source = self._require_hardware_source()
@@ -176,6 +200,8 @@ class NionUSimAdapter:
             raise RuntimeError(
                 f"Expected a 2-D HAADF image, received shape {data.shape}"
             )
+        self._last_record_parameters = dict(frame_parameters)
+        self._last_record_profile_index = int(hardware_source.profile_index)
         return data
 
     def _record_cancellable(self, source, parameters):
@@ -246,3 +272,9 @@ class NionUSimAdapter:
         if self._hardware_source is None:
             raise RuntimeError("NionUSimAdapter is not connected")
         return self._hardware_source
+
+
+def nion_cancel_callback(print_function):
+    # ScriptsDialog supplies its bound print method to the executed script.
+    dialog = getattr(print_function, "__self__", None)
+    return lambda: bool(getattr(dialog, "cancelled", False) or getattr(dialog, "_RunScriptDialog__is_closed", False))

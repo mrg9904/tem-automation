@@ -1,4 +1,4 @@
-"""Trace particle outlines and cover them with nonoverlapping square FoVs."""
+"""Trace particle outlines and cover them with sparse, ordered square FoVs."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -131,7 +131,84 @@ def _trace_contours(mask):
     return loops
 
 
-def _cover_edges(points, side_px, pixel_size, shape, phase_steps, center_on_edge=False):
+
+def _ordered_edge_centers(loop, side_px):
+    """Cover successive contour intervals with maximal spans, trying loop phases.
+
+    A center must lie on this contour and cover every sample in its interval.
+    Bounding rectangles also guarantee coverage between samples on pixel borders.
+    Phase trials reduce the small residual interval at the closure. This is a
+    heuristic, not a globally minimal square covering.
+    """
+    points = np.empty((2 * (len(loop) - 1), 2))
+    points[::2] = loop[:-1]
+    points[1::2] = (loop[:-1] + loop[1:]) / 2
+    tree = cKDTree(points)
+    half = side_px / 2 + 1e-10
+    best = None
+    for start in np.unique(np.linspace(0, len(points), 9, endpoint=False, dtype=int)):
+        check_cancelled()
+        ordered = np.roll(points, -start, axis=0)
+        ordered = np.vstack((ordered, ordered[0]))
+        chosen = []
+        first = 0
+        while first < len(ordered):
+            check_cancelled()
+            def feasible(stop):
+                segment = ordered[first:stop]
+                lower = segment.max(axis=0) - half
+                upper = segment.min(axis=0) + half
+                if np.any(lower > upper):
+                    return np.empty(0, dtype=int)
+                midpoint = (lower + upper) / 2
+                indices = np.asarray(tree.query_ball_point(midpoint, half, p=np.inf), dtype=int)
+                candidates = points[indices]
+                return indices[np.all((candidates >= lower) & (candidates <= upper), axis=1)]
+
+            # Feasible rectangles shrink as the interval grows; binary search
+            # the longest interval that can share an edge-centered square.
+            low, high = first + 1, len(ordered) + 1
+            while low + 1 < high:
+                middle = (low + high) // 2
+                if len(feasible(middle)):
+                    low = middle
+                else:
+                    high = middle
+            candidates = points[feasible(low)]
+            segment = ordered[first:low]
+            midpoint = (segment.min(axis=0) + segment.max(axis=0)) / 2
+            center = candidates[np.argmin(np.sum((candidates - midpoint)**2, axis=1))]
+            chosen.append(center)
+            # Share the endpoint so every segment, including the closing one,
+            # is wholly covered by at least one square.
+            first = low - 1 if low < len(ordered) else low
+        centers = np.asarray(chosen)
+        neighbors = tree.query_ball_point(centers, half, p=np.inf)
+        # Prune only if entire segments remain covered, not just their endpoints.
+        segment_neighbors = []
+        for indices in neighbors:
+            covered = np.zeros(len(points), dtype=bool)
+            covered[indices] = True
+            segment_neighbors.append(np.flatnonzero(covered & np.roll(covered, -1)))
+        neighbors = segment_neighbors
+        counts = np.bincount(np.concatenate(neighbors), minlength=len(points))
+        keep = np.ones(len(centers), dtype=bool)
+        for index in range(len(centers) - 1, -1, -1):
+            covered = neighbors[index]
+            if np.all(counts[covered] > 1):
+                keep[index] = False
+                counts[covered] -= 1
+        centers = centers[keep]
+        lengths = np.maximum(0, side_px - np.abs(centers[:, None] - centers[None, :]))
+        overlap = np.prod(lengths, axis=2)
+        np.fill_diagonal(overlap, 0)
+        quality = (len(centers), float(overlap.sum()))
+        if best is None or quality < best[0]:
+            best = (quality, centers)
+    return best[1]
+
+
+def _cover_edges(points, side_px, pixel_size, shape, phase_steps, center_on_edge=False, contours=()):
     """Search grid phases for a sparse, exact-size, zero-area-overlap covering."""
     if not len(points):
         return np.empty(0, dtype=BOX_DTYPE)
@@ -148,33 +225,8 @@ def _cover_edges(points, side_px, pixel_size, shape, phase_steps, center_on_edge
     centers = (cells + 0.5) * side_px + phase
     centers = centers[np.lexsort((centers[:, 0], centers[:, 1]))]
     if center_on_edge:
-        # Cover boundary samples using centers drawn from the boundary itself.
-        # Penalize square overlap while ensuring every sample is still covered.
-        candidates = np.unique(samples, axis=0)
-        tree = cKDTree(samples)
-        neighbors = tree.query_ball_point(candidates, side_px / 2 + 1e-10, p=np.inf)
-        uncovered = np.ones(len(samples), dtype=bool)
-        chosen = []
-        while uncovered.any():
-            check_cancelled()
-            gain = np.asarray([np.count_nonzero(uncovered[indices]) for indices in neighbors], dtype=float)
-            penalty = np.ones(len(candidates))
-            for previous in chosen:
-                lengths = np.maximum(0, side_px - np.abs(candidates - previous))
-                penalty += np.prod(lengths, axis=1) / side_px**2
-            selected = int(np.argmax(gain / penalty))
-            chosen.append(candidates[selected])
-            uncovered[neighbors[selected]] = False
-        cover_lists = tree.query_ball_point(np.asarray(chosen), side_px / 2 + 1e-10, p=np.inf)
-        counts = np.bincount(np.concatenate(cover_lists), minlength=len(samples))
-        keep = np.ones(len(chosen), dtype=bool)
-        for index in range(len(chosen) - 1, -1, -1):
-            indices = cover_lists[index]
-            if np.all(counts[indices] > 1):
-                keep[index] = False
-                counts[indices] -= 1
-        centers = np.asarray(chosen)[keep]
-        centers = centers[np.lexsort((centers[:, 0], centers[:, 1]))]
+        centers = np.concatenate([_ordered_edge_centers(loop, side_px)
+                                  for loop in contours])
     boxes = np.empty(len(centers), dtype=BOX_DTYPE)
     height, width = shape
     for i, (x, y) in enumerate(centers, start=1):
@@ -222,7 +274,9 @@ def find_edge_in_image(image, *, fov_m: float, box_fov_m: float,
     FoV describes the longest image side, assuming square pixels. Centers are
     image-axis offsets, not absolute stage coordinates. Boxes may extend beyond
     the original image, and are flagged; they are never shrunk to fit it.
-    The grid-phase heuristic minimizes count among sampled phases, not globally.
+    Grid mode minimizes count among sampled grid phases. Edge-centered mode
+    covers maximal successive contour intervals and tries multiple loop starts;
+    neither heuristic guarantees a global minimum.
     """
     if not np.isfinite(box_fov_m) or box_fov_m <= 0:
         raise ValueError("box_fov_m must be finite and positive")
@@ -251,7 +305,7 @@ def find_edge_in_image(image, *, fov_m: float, box_fov_m: float,
         raise ValueError("box FoV is smaller than one image pixel; acquire a higher-resolution image")
     # Cover each actual segment; do not add artificial lines between separate loops.
     samples = np.concatenate([np.concatenate((loop, (loop[:-1] + loop[1:]) / 2)) for loop in contours]) if contours else points
-    boxes = _cover_edges(samples, side_px, pixel_size, result.image.shape, config.grid_phase_steps, config.center_on_edge)
+    boxes = _cover_edges(samples, side_px, pixel_size, result.image.shape, config.grid_phase_steps, config.center_on_edge, contours)
     boxes = _order_boxes_along_contours(boxes, contours)
     return FindEdgeResult(result.image, result.labels, float(fov_m), float(box_fov_m),
                           points, offsets, np.asarray(ids, dtype=np.int32), np.asarray(touches, dtype=bool), boxes)

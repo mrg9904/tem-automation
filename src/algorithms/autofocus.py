@@ -48,6 +48,39 @@ class AutofocusConfig:
     max_search_offset_fov_fraction: float = 16.0
     score_relative_tolerance: float = 0.01
     minimum_precision_m: float = 0.0
+    minimum_score_span_fraction: float = 0.0
+
+
+    def validate(self):
+        if not np.isfinite(self.precision_fov_fraction) or self.precision_fov_fraction <= 0:
+            raise ValueError("precision_fov_fraction must be positive")
+        if not np.isfinite(self.initial_half_range_fov_fraction) or self.initial_half_range_fov_fraction <= 0:
+            raise ValueError(
+                "initial_half_range_fov_fraction must be positive"
+            )
+        if self.points_per_round < 3 or self.points_per_round % 2 == 0:
+            raise ValueError("points_per_round must be an odd integer >= 3")
+        if self.max_rounds < 1:
+            raise ValueError("max_rounds must be at least one")
+        if self.frames_per_position < 1:
+            raise ValueError("frames_per_position must be at least one")
+
+        if self.max_expansion_rounds < 0:
+            raise ValueError("max_expansion_rounds must be nonnegative")
+        if not np.isfinite(self.max_search_offset_fov_fraction) or self.max_search_offset_fov_fraction <= 0:
+            raise ValueError("max_search_offset_fov_fraction must be positive")
+        if not np.isfinite(self.score_relative_tolerance) or self.score_relative_tolerance < 0:
+            raise ValueError("score_relative_tolerance must be nonnegative")
+        if not np.isfinite(self.minimum_precision_m) or self.minimum_precision_m < 0:
+            raise ValueError("minimum_precision_m must be finite and nonnegative")
+        if not np.isfinite(self.minimum_score_span_fraction) or self.minimum_score_span_fraction<0:
+            raise ValueError('minimum_score_span_fraction must be finite and nonnegative')
+        for name in ('points_per_round','max_rounds','frames_per_position','max_expansion_rounds'):
+            value=getattr(self,name)
+            if not isinstance(value,(int,np.integer)) or isinstance(value,bool):
+                raise ValueError(name+' must be an integer')
+        if not np.isfinite(self.settle_time_s) or self.settle_time_s<0:
+            raise ValueError('settle_time_s must be finite and nonnegative')
 
 
 DEFAULT_AUTOFOCUS_CONFIG = AutofocusConfig()
@@ -96,27 +129,7 @@ def autofocus(
     metric: FocusMetric = tenengrad_score,
 ) -> AutofocusResult:
     """Run adaptive HAADF autofocus using the active profile FoV."""
-    if config.precision_fov_fraction <= 0:
-        raise ValueError("precision_fov_fraction must be positive")
-    if config.initial_half_range_fov_fraction <= 0:
-        raise ValueError(
-            "initial_half_range_fov_fraction must be positive"
-        )
-    if config.points_per_round < 3 or config.points_per_round % 2 == 0:
-        raise ValueError("points_per_round must be an odd integer >= 3")
-    if config.max_rounds < 1:
-        raise ValueError("max_rounds must be at least one")
-    if config.frames_per_position < 1:
-        raise ValueError("frames_per_position must be at least one")
-
-    if config.max_expansion_rounds < 0:
-        raise ValueError("max_expansion_rounds must be nonnegative")
-    if not np.isfinite(config.max_search_offset_fov_fraction) or config.max_search_offset_fov_fraction <= 0:
-        raise ValueError("max_search_offset_fov_fraction must be positive")
-    if not np.isfinite(config.score_relative_tolerance) or config.score_relative_tolerance < 0:
-        raise ValueError("score_relative_tolerance must be nonnegative")
-    if not np.isfinite(config.minimum_precision_m) or config.minimum_precision_m < 0:
-        raise ValueError("minimum_precision_m must be finite and nonnegative")
+    config.validate()
     check_cancelled()
     original_defocus_m = microscope.get_defocus()
     fov_m = microscope.get_fov()
@@ -191,6 +204,15 @@ def autofocus(
                 best_index == 0
                 or best_index == len(round_results) - 1
             )
+
+            if round_index == 0 and config.minimum_score_span_fraction > 0:
+                coarse_scores = np.asarray([item.score for item in round_results])
+                if not np.isfinite(coarse_scores).all():
+                    raise RuntimeError('Autofocus metric returned a nonfinite score')
+                scale = max(float(np.max(np.abs(coarse_scores))), np.finfo(float).eps)
+                if np.ptp(coarse_scores) <= config.minimum_score_span_fraction*scale:
+                    stop_reason = 'low_score_confidence'
+                    break
 
             if not best_is_at_boundary and bracket is None:
                 bracket = (float(positions[best_index - 1]), float(positions[best_index + 1]))

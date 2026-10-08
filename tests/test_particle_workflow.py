@@ -1,4 +1,6 @@
 import json
+from contextlib import contextmanager
+from adapters.coordinates import ImageStageTransform
 from pathlib import Path
 import tempfile
 import unittest
@@ -19,6 +21,20 @@ class WorkflowMicroscope:
         self.acquisitions = 0
         self.moves = []
         self.empty = empty
+
+    @contextmanager
+    def acquisition_settings(self, *, image_size_px, dwell_time_us=1.0):
+        yield
+
+    def get_coordinate_transform(self):
+        return ImageStageTransform()
+
+    def get_last_scan_profile(self):
+        return {'profile_index':0,'parameters':{'pixel_size':(1024,1024),'pixel_time_us':1.,'fov_nm':self.fov*1e9}}
+
+    def persist_last_scan_profile(self, snapshot=None):
+        self.final_profile = snapshot
+        return snapshot
 
     def get_stage_position(self):
         return self.stage
@@ -64,7 +80,7 @@ class ParticleWorkflowTest(unittest.TestCase):
 
     def test_all_particles_capture_correct_absolute_positions_and_restore_state(self):
         microscope = WorkflowMicroscope()
-        with tempfile.TemporaryDirectory() as root, mock.patch.object(workflow, 'autofocus', side_effect=focus_result), mock.patch('builtins.print'):
+        with tempfile.TemporaryDirectory() as root, mock.patch('scripts.common.autofocus', side_effect=focus_result), mock.patch('builtins.print'):
             run = workflow.run_particle_workflow(microscope, root, config=self.config)
             report = json.loads((run / 'run.json').read_text())
             self.assertEqual(report['status'], 'completed')
@@ -95,7 +111,7 @@ class ParticleWorkflowTest(unittest.TestCase):
                 microscope.set_defocus(-50e-9)
                 raise RuntimeError('focus failed')
             return focus_result(microscope, config)
-        with tempfile.TemporaryDirectory() as root, mock.patch.object(workflow, 'autofocus', side_effect=fail_first), mock.patch('builtins.print'):
+        with tempfile.TemporaryDirectory() as root, mock.patch('scripts.common.autofocus', side_effect=fail_first), mock.patch('builtins.print'):
             run = workflow.run_particle_workflow(microscope, root, config=self.config)
             report = json.loads((run / 'run.json').read_text())
             self.assertEqual(report['status'], 'completed_with_errors')
@@ -107,7 +123,7 @@ class ParticleWorkflowTest(unittest.TestCase):
     def test_fail_fast_restores_and_checkpoints_aborted_run(self):
         microscope = WorkflowMicroscope()
         config = workflow.ParticleWorkflowConfig(continue_on_error=False, finding=self.config.finding)
-        with tempfile.TemporaryDirectory() as root, mock.patch.object(workflow, 'autofocus', side_effect=RuntimeError('focus failed')), mock.patch('builtins.print'):
+        with tempfile.TemporaryDirectory() as root, mock.patch('scripts.common.autofocus', side_effect=RuntimeError('focus failed')), mock.patch('builtins.print'):
             with self.assertRaisesRegex(RuntimeError, 'focus failed'):
                 workflow.run_particle_workflow(microscope, root, config=config)
             run = next(Path(root).iterdir())
@@ -119,7 +135,7 @@ class ParticleWorkflowTest(unittest.TestCase):
 
     def test_empty_overview_saves_report_without_autofocus(self):
         microscope = WorkflowMicroscope(empty=True)
-        with tempfile.TemporaryDirectory() as root, mock.patch.object(workflow, 'autofocus') as focus, mock.patch('builtins.print'):
+        with tempfile.TemporaryDirectory() as root, mock.patch('scripts.common.autofocus') as focus, mock.patch('builtins.print'):
             run = workflow.run_particle_workflow(microscope, root, config=self.config)
             report = json.loads((run / 'run.json').read_text())
             self.assertEqual(report['particle_count'], 0)

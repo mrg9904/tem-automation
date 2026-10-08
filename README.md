@@ -1,275 +1,153 @@
 # TEM Automation
 
-The runtime code is deliberately divided into only three layers:
+TEM automation with three runtime layers: device adapters, reusable algorithms,
+and experiment scripts. Nion Swift/uSim is the current device backend.
 
 ```text
 src/
-├── adapters/
-│   ├── base.py
-│   └── nion_usim.py
-├── algorithms/
-│   └── autofocus.py
-└── scripts/
-    └── usim_haadf_autofocus.py
+  adapters/
+    base.py                 device protocols and capability validation
+    coordinates.py          shared image/stage transforms
+    cancellation.py         generic cooperative cancellation
+    nion_usim.py             Nion API, acquisition, profiles, UI cancellation binding
+  algorithms/
+    FindParticles.py        particle detection and indexing
+    FindEdge.py             ordered contour tracing and edge boxes
+    Zoom2Fit.py             positioning and FoV fitting
+    autofocus.py            focus search and configuration validation
+    FindROI.py              stable public ROI API
+    roi/                    features, reference, detection, results, output, mosaic
+  scripts/
+    common.py               typed capture pipeline, checkpoints, state and logging
+    usim_particle_workflow.py
+    usim_particle_edge_workflow.py
+    usim_find_particles.py
+    usim_find_roi.py
+    usim_haadf_autofocus.py
 ```
 
-- `adapters`: defines a small vendor-independent microscope API, stores the
-  current acquisition configuration, and translates calls to a vendor API.
-- `algorithms`: owns algorithm-specific defaults and calls only the
-  vendor-independent microscope API.
-- `scripts`: initializes an instrument and lists the high-level experiment
-  actions to execute.
+Adapters do not import algorithms or scripts. Algorithms do not import scripts
+or the Nion backend. Scripts choose experiment policy and orchestrate public
+operations. Workflows share helpers through `scripts.common`, rather than
+importing private helpers from another experiment script.
+See [architecture and contracts](docs/architecture.md).
 
-The `tests` directory is development support and is not part of the runtime
-architecture.
-
-## Install in the Nion Swift development environment
+## Install and test
 
 ```bat
 conda activate nionswift-dev
 cd /d D:\Development\tem-automation
-python -m pip install -e .
-```
-
-## Test
-
-```bat
+python -m pip install -e . --no-deps --no-build-isolation
 python -m unittest discover -s tests -v
 ```
 
-## Run in Nion Swift
+Dependencies: Python >=3.10, NumPy >=1.24, SciPy >=1.10 and Pillow >=10.1.
+There is no PyTorch or pretrained-model download requirement.
 
-Start Nion Swift and uSim, then choose `File > Scripts...` and add:
+## Run the edge experiment
+
+In Nion Swift, open `File > Scripts...` and add
+`src/scripts/usim_particle_edge_workflow.py`. Start from an overview containing
+particles #4, #5 and #6. The entry script processes **#4 -> #5 -> #6**, using
+FindParticles IDs sorted top-to-bottom then left-to-right. Before each subsequent
+particle, it restores the initial overview position, FoV and defocus. Each particle
+has a separate run directory; cancellation stops the entire sequence.
+`run_particle_edge_workflow` remains available for individual particles, and
+`run_particle_edge_sequence(..., particle_ids=(4, 5, 6))` configures the sequence.
+
+The script fits that particle, traces its edge, and visits 50 nm FoV boxes in
+contour order. Edge-centered boxes cover maximal consecutive contour intervals;
+multiple loop starts and segment-safe redundant-box removal reduce overlap while
+keeping the entire contour covered. This is a heuristic, not a global minimum.
+Stage targets use one fixed particle-view reference, so offsets
+do not accumulate and the workflow does not return to the center between boxes.
+Focus frames are 512 x 512; final photographs are 1024 x 1024. Focus search starts
+at +/-4 FoV, then uses +/-0.5 FoV after a converged box. Weak coarse score spans
+(<=2%) or other nonconvergence retry once using 3 frames per position and at
+least +/-4 FoV. Practical minimum precision is 5 nm. Convergence is a search
+criterion and does not guarantee every real image is sharply focused.
+
+Each photograph is analyzed in memory using the frozen normal reference at
+`src/scripts/roi_reference.npz`. Positive detections print only:
 
 ```text
-D:\Development\tem-automation\src\scripts\usim_haadf_autofocus.py
+***ROI Found*** particle #4, box 21: shape variation, texture variation
 ```
 
-Double-click the script to run HAADF autofocus. The script contains only the
-instrument initialization and the high-level `autofocus(microscope)` action.
+Unconverged final focus and failures print `***Warning***`. The output window
+supports plain text; `workflow_messages.html` provides a green ROI/orange
+Warning record. The results directory is printed when the run ends.
 
-Autofocus initially searches the current defocus +/- one active profile FoV
-(a total width of twice the FoV). If the highest focus score lies at either
-endpoint, it centers on that endpoint and doubles the half-range until a
-peak is bracketed. It then refines to 1% of the FoV. The default 12-round
-budget bounds both expansion and refinement; an unbracketed search reports
-`converged=False` and retains the best measured focus. Acquisition failures
-restore the original defocus.
+Results are under
+`src/scripts/particle_edge_workflow_results/<timestamp>/particle_NNNN/`:
 
-## Find particles in the current FoV
+- Each `edge_box_NNNN/`: raw `haadf.npz`, display `haadf.png`, focus trace,
+  zoom/capture metadata, and `roi/` annotations/positions/scores.
+- `roi/haadf_roi.png`: candidate bounds, centers, IDs and maximum scores.
+- `roi/find_roi.npz`: original image, labels, candidates, descriptions,
+  corrected/reference score maps, contextual baseline and threshold map.
+- `roi/roi_positions.json`: image-axis offsets and capture stage/FoV/focus.
+- `mosaic/`: plain/annotated HAADF mosaic, raw composite/coverage NPZ and ROI
+  geometry JSON. Composition uses recorded positions and mean overlap intensity;
+  uncovered areas are black. Maximum side is 4096 pixels. It decodes images one
+  at a time and does not perform registration/hysteresis correction or ROI
+  deduplication across overlapping frames.
+- The run root holds `run.json` and `workflow_messages.html`.
 
-Add `src/scripts/usim_find_particles.py` to Nion Swift's
-Scripts panel and run it. It acquires a 512 x 512 HAADF frame using the active
-scan profile and creates a new timestamped run directory under
-`src/scripts/find_particles_results/` on every execution. Each run saves:
+On normal completion, the last saved photograph's stage/FoV/focus and profile
+parameters are retained for manual Scan, including 1024 x 1024 pixels, dwell
+and rotation. `preserve_last_scan=False` restores the initial state instead.
+Cancel or an aborted run restores initial stage/FoV/focus. Click Cancel, or
+create an empty `STOP` file in the active run folder; cancellation skips mosaic
+creation. Driver shutdown may have device-dependent delays.
 
-- `find_particles.npz`: original float HAADF data, labels, particle table and metadata.
-- `haadf.png`: unannotated grayscale HAADF display image.
-- `haadf_annotated.png`: HAADF with green enclosing circles, cyan center crosses,
-  and yellow particle IDs matching the array table.
+Capture and ROI-analysis statuses are separate. ROI failure retains a valid
+photograph and that frame can still enter the mosaic without ROI annotations.
+The run records final profile/state, focus retries and error stage.
 
-Focus and stage position are preserved. PNGs use the same linear 8-bit display
-scaling; use the archive for quantitative intensities. The circles enclose the
-detected regions around their centroids and do not measure particle diameter.
-An edge particle's circle may extend beyond the image. Output folders are
-ignored by Git. The script prints the full run directory after saving.
+## ROI reference and scoring
 
-The algorithm module is `algorithms.FindParticles`:
+This is an offline spatial/FFT normal-reference baseline, **not original
+PatchCore**. It proposes anomalies and does not identify defect/crystal phases.
+No circle-specific shape rule is used. Scores are feature distances, not
+probabilities; descriptions summarize contributing feature groups.
+
+Normal patches use a default 5 nm window, 2 nm stride and 0.2 nm analysis pixel
+scale. A patch has 34 spatial/intensity/gradient/FFT features. Explicit normal
+blur variants estimate feature reliability. A bounded memory preserves diverse
+anchors and representative descriptors. Independent normal validation, including
+intermediate blur scales, calibrates background/bulk/edge thresholds. Local
+same-context median/MAD variation is removed from the reference distance; very
+strong reference evidence can bypass that correction. Broad weak anomalies can
+still be suppressed, and low-score corner/image-quality false positives remain
+possible. Resampling does not create atomic-resolution information.
 
 ```python
-from algorithms.FindParticles import find_particles
-result = find_particles(microscope, output_path="particles.npz")
+from algorithms.FindROI import ROIReferenceBank, find_roi_in_image
+
+# Samples are (HAADF array, FoV in meters), explicitly confirmed normal.
+reference = ROIReferenceBank().fit(approved_normal_samples)
+reference.calibrate(independent_normal_validation_samples)
+reference.save("src/scripts/roi_reference.npz")
+result = find_roi_in_image(image, fov_m=50e-9, reference=reference)
+result.save("roi_output")
 ```
 
-For an existing image, use `find_particles_in_image(image, fov_m=...)` and
-`result.save("particles.npz")`. Use `result.save_images("output_directory")`
-to export the two PNG images. `FindParticlesConfig` controls Gaussian
-smoothing, the minimum region area (16 pixels by default), a manual threshold
-(default: Otsu), bright/dark particles, and exclusion of edge particles.
-The initial implementation detects separated bright regions. Touching or
-projected overlapping particles form one region; dim particles and strongly
-varying backgrounds may need a manual threshold. Edge particles are included
-and flagged by default; their detected center is the visible region's center.
+Include normal corners, orientations, bulk and allowed imaging variations.
+Updating the bank invalidates calibration; retain original normal images and
+recalibrate. Target images never automatically enter the normal database.
+Reference/result format remains v2 (`local_spatial_fft_context_v2`). Local
+reference files and acquisition results are ignored by git.
 
-```python
-import numpy as np
-with np.load("particles.npz", allow_pickle=False) as data:
-    particles = data["particles"]
-    labels = data["labels"]
-    image = data["image"]
-```
+## Validation and review tools
 
-`particles` is a structured array with fields `id`, `center_x_px`,
-`center_y_px`, `offset_x_m`, `offset_y_m`, `area_px`, `circle_diameter_px`,
-`circle_diameter_m`, and `touches_edge`. Circle diameters are saved in pixels
-and meters and are used directly to draw the PNG overlay. The diameter is
-`2 * max(4, maximum pixel-center distance from centroid + 1)` pixels; it is
-an annotation extent, not a measured particle diameter.
-IDs start at 1, sorted by center row then column, and correspond to the
-integer region labels in `labels`; 0 means background. IDs are local to each
-acquisition. An empty detection produces an empty table and a zero label map.
-Pixel coordinates use x=column and y=row, with integer pixel centers.
-Offsets use image axes (x right, y down), relative to the image center.
-They are not stage coordinates and do not account for scan rotation.
-The scalar FoV denotes the longest image side, assuming square pixels.
-The archive also stores schema version 2 (adds the circle diameter fields), image shape, FoV and pixel size in
-meters, threshold and detection settings, and a coordinate-system description.
+Tests cover detection, physical coordinates, focus confidence/retry,
+cancellation/restoration, final scan profile, partial failures, serialization,
+layer boundaries and in-memory/lazy processing. The optional local saved-image
+regression checks all maps/candidates/descriptions against pre-refactor
+fingerprints for 31 HAADF frames; it skips when local data is absent.
 
-## Center and zoom to a particle
-
-`algorithms/Zoom2Fit.py` exports `zoom_to_fit`. Center coordinates are `(x, y)`
-in meters relative to the current image center; diameter is in meters.
-
-```python
-from algorithms.Zoom2Fit import zoom_to_fit
-particle = result.particles[0]  # From FindParticles for the current view.
-zoom = zoom_to_fit(
-    microscope,
-    (particle["offset_x_m"], particle["offset_y_m"]),
-    particle["circle_diameter_m"],
-    padding=1.1,  # Optional 10% margin; default is 1.0 (FoV = diameter).
-)
-print(zoom.actual_fov_m)
-```
-
-The uSim adapter accounts for scan rotation and moves the stage using the same
-convention as interactive double-click centering. FoV is saved to the active
-profile while preserving other profile settings. The result records requested
-and actual FoV and before/after stage positions. Defocus is unchanged; this
-action does not acquire a new image. Failures attempt to restore both FoV and
-stage position, and report incomplete restoration explicitly.
-Only use offsets from the current view: saved offsets become stale after
-moving the stage, changing scan center or rotation. Recenter or re-detect before
-selecting another particle. A scalar size assumes a square acquisition FoV.
-
-## Find particles, autofocus, and capture every particle
-
-Add `src/scripts/usim_particle_workflow.py` to Nion Swift's Scripts panel.
-Select the overview sample/FoV and run it. The modular workflow composes
-`find_particles`, `zoom_to_fit`, and `autofocus`; it uses 512 x 512 overview/focus images and 1024 x 1024 final captures.
-No initial overview autofocus is performed: detection uses the current focus.
-
-Each run creates `src/scripts/particle_workflow_results/<timestamp>/`:
-
-- `overview/`: particle table, original HAADF, and circles/centers/IDs.
-- `particle_0001/`, etc.: `haadf.npz` (float image, stage x/y in meters,
-  actual FoV, pixel size and defocus), `haadf.png`, `zoom.json`,
-  `autofocus.json`, `autofocus.npz` (focus positions/scores), and `particle.json`.
-- `run.json`: initial state, configuration, particle count, per-particle
-  outcomes, and whether the original instrument state was restored.
-
-Before each particle, the workflow restores the overview stage/FoV/defocus,
-then centers on the saved offset and zooms to its circle diameter plus 10%
-margin. It autofocuses and acquires a separate final HAADF frame.
-At completion or failure, it attempts to restore the original stage/FoV/defocus.
-Individual errors are logged and processing continues by default; restoration
-failures abort the run. Nonconverged autofocus still records the best measured
-focus and marks the capture `captured_unconverged` explicitly. An empty overview
-saves the overview and run report without taking per-particle captures.
-Do not change the sample, selected profile, scan rotation, beam shift, or
-stage controls while the workflow runs. Overview detection limitations still
-apply: touching particles can be merged, and edge regions have partial centers.
-
-For custom settings or a different output path:
-
-```python
-from scripts.usim_particle_workflow import ParticleWorkflowConfig, run_particle_workflow
-from algorithms.autofocus import AutofocusConfig
-config = ParticleWorkflowConfig(padding=1.2, continue_on_error=False,
-                               autofocus=AutofocusConfig(max_rounds=12))
-run_particle_workflow(microscope, "output_directory", config=config)
-```
-
-## Find particle edges and acquisition boxes
-
-`algorithms/FindEdge.py` provides `find_edge(microscope, box_fov_m)` and
-`find_edge_in_image(image, fov_m=..., box_fov_m=..., particle_id=None)`.
-It uses FindParticles segmentation, traces ordered pixel-cell outlines and
-covers the selected boundaries with edge-centered squares by default (or a shared square grid). Grid phases are
-searched to reduce box count; in the optional grid mode distinct boxes have no area overlap. This is a
-heuristic covering, not a globally optimal minimum-box solution.
-
-`result.box_centers_m` is an N x 2 array of image-axis (x, y) offsets in meters.
-`result.boxes` contains IDs, pixel centers, meter offsets, box FoV and a flag
-for boxes extending outside the image. Use these centers with Zoom2Fit from
-the same reference view. `result.save("edge.npz")` records original data,
-ordered boundary points (pixels and meter offsets), contour offsets and
-particle IDs, and boxes; `result.save_overlay("edge.png")` draws cyan edges,
-yellow acquisition squares and red centers. Particle IDs refer to detection
-in the supplied image, rather than earlier overview IDs. Holes are filled by
-default; set outer_edges_only=False to include internal boundaries.
-Frame-touching contours include the image cut and are flagged as incomplete
-physical outlines. Boxes smaller than one image pixel are rejected.
-
-Run `python tests/preview_find_edge.py` in nionswift-dev to generate a 10 x 10 nm
-box preview using the latest saved particle #1 close-up. Outputs are under
-`tests/find_edge_results/<run>/`. Use `--source` and `--output` to override.
-
-## Particle #1 edge autofocus workflow (50 nm boxes)
-
-Add `src/scripts/usim_particle_edge_workflow.py` to Nion Swift's Scripts panel.
-Start at the overview containing your intended particle #1. It detects the
-current view, centers/fits overview particle #1 with 10% margin, and acquires
-a close-up. It selects the region containing the close-up image center (or
-the nearest centroid), runs FindEdge with 50 x 50 nm boxes, and for every box
-runs Zoom2Fit with no extra margin, autofocus, and a separate HAADF capture.
-Overview and focus images are 512 x 512; final per-box photographs are 1024 x 1024. The script needs no file from a previous run.
-
-Results: `src/scripts/particle_edge_workflow_results/<timestamp>/`:
-
-- `overview/`: detected particles and the annotated overview image.
-- `particle_0001/`: zoom/reference metadata, `find_edge.npz`, and
-  `haadf_edge_boxes.png` for visual checking.
-- `particle_0001/edge_box_0001/`, etc.: `haadf.png`, `haadf.npz` (particle ID 1,
-  actual FoV, stage, defocus and float image), autofocus arrays/JSON,
-  zoom metadata and `box.json` (box ID and center).
-- `run.json`: every box's outcome and restoration state.
-
-Each box is anchored to the same particle close-up baseline and reached
-directly from the preceding box, preventing accumulated movement. On completion or failure the ORIGINAL overview stage,
-FoV and defocus are restored. Individual box errors are logged and processing
-continues; nonconverged autofocus captures best measured focus and is flagged.
-Do not change the sample, rotation, profile or other microscope controls
-while running. Particle #1 uses FindParticles overview numbering, not an
-arbitrary specimen ID. Frame-touching edges are flagged in saved metadata.
-Customize `ParticleEdgeWorkflowConfig` for other box sizes or focus parameters.
-
-## Edge centering, focus stability, and stopping a workflow
-
-FindEdge now defaults to centers on the traced edge. Covering curved edges
-with edge-centered squares can require some overlap; coverage is maintained
-and overlap is penalized in the greedy selection. Set `center_on_edge=False`
-for the original zero-overlap grid, whose centers need not lie on the edge.
-Autofocus averages three frames by median, uses mean-intensity normalization,
-limits range expansion, and never expands outside an already bracketed peak.
-Flat scores stop with `score_plateau`; exhausted expansion stops with
-`expansion_limit`. These are nonconverged results saved explicitly.
-The edge workflow starts with a smaller +/- half-FoV focus search.
-
-Click Nion Swift's Cancel to request a cooperative stop. Acquisition waits
-poll cancellation and attempt to abort the active record. The current run
-report becomes `cancelled`, existing results are retained, and stage/FoV/focus
-restoration is attempted with cancellation suspended. Alternatively create an
-empty file named `STOP` inside the timestamped run directory printed by the
-script. This requests the same stop without using the Scripts dialog.
-Startup and device-driver shutdown can still have device-dependent delays;
-these changes have automated cancellation tests but need live GUI verification.
-
-The edge workflow now uses a 5 nm minimum focus precision, 5 search positions
-per round, and one frame per position. First-box search starts at +/- 4 FoV;
-after a converged box, the next starts at that best focus with +/- half FoV.
-Focus acquisition uses 512 x 512 pixels; final captures use
-1024 x 1024. Overview and edge detection remain 512 x 512. Acquisition settings are restored even on failure or cancellation.
-A plateau near a good focus previously counted as nonconvergence when the
-requested 0.5 nm precision was finer than the score could resolve.
-
-Edge boxes are now numbered along each traced contour's arclength, starting
-near the contour's top-left and traversing its ordered outline (clockwise for
-outer boundaries in image coordinates). The table stores `contour_id` and
-`arc_length_px`; FindEdge archive schema is now version 2. The overlay shows
-box IDs. Each contour is processed consecutively; separate contours are
-separate paths. The edge workflow moves directly between absolute targets
-computed from the saved particle reference. It no longer returns the stage
-to the particle center between boxes. The original overview is restored only
-at the end. This reduces unnecessary direction reversals but does not calibrate
-or compensate mechanical stage hysteresis.
+`tests/preview_find_roi.py` rebuilds a provisional particle #1 reference and
+reviews stored particle #2 photographs under `tests/edge_review_results/`.
+Those images and manual-label provenance are local artifacts. Preview results
+are not substitutes for validation on real specimens.
