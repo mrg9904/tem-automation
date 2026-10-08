@@ -8,6 +8,7 @@ import numpy as np
 import numpy.typing as npt
 
 from adapters.base import Microscope
+from adapters.cancellation import check_cancelled, suspend_cancellation
 
 
 FocusMetric = Callable[[npt.NDArray[np.float32]], float]
@@ -29,6 +30,7 @@ class AutofocusResult:
     rounds: int
     converged: bool
     measurements: tuple[FocusMeasurement, ...]
+    stop_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -41,7 +43,11 @@ class AutofocusConfig:
     points_per_round: int = 7
     max_rounds: int = 12
     settle_time_s: float = 0.0
-    frames_per_position: int = 1
+    frames_per_position: int = 3
+    max_expansion_rounds: int = 4
+    max_search_offset_fov_fraction: float = 16.0
+    score_relative_tolerance: float = 0.01
+    minimum_precision_m: float = 0.0
 
 
 DEFAULT_AUTOFOCUS_CONFIG = AutofocusConfig()
@@ -71,7 +77,10 @@ def tenengrad_score(image: npt.NDArray[np.float32]) -> float:
     if dynamic_range <= np.finfo(np.float64).eps:
         return 0.0
 
-    normalized = np.clip((data - low) / dynamic_range, 0.0, 1.0)
+    # Mean intensity is approximately conserved under defocus. Per-frame
+    # contrast normalization incorrectly boosts blurred edges back to full contrast.
+    scale = max(abs(float(np.mean(finite))), np.finfo(np.float64).eps)
+    normalized = np.clip(data, low, high) / scale
     smoothed = _box_blur_3x3(normalized)
     gradient_y, gradient_x = np.gradient(smoothed)
     gradient_energy = gradient_x * gradient_x + gradient_y * gradient_y
@@ -100,12 +109,21 @@ def autofocus(
     if config.frames_per_position < 1:
         raise ValueError("frames_per_position must be at least one")
 
+    if config.max_expansion_rounds < 0:
+        raise ValueError("max_expansion_rounds must be nonnegative")
+    if not np.isfinite(config.max_search_offset_fov_fraction) or config.max_search_offset_fov_fraction <= 0:
+        raise ValueError("max_search_offset_fov_fraction must be positive")
+    if not np.isfinite(config.score_relative_tolerance) or config.score_relative_tolerance < 0:
+        raise ValueError("score_relative_tolerance must be nonnegative")
+    if not np.isfinite(config.minimum_precision_m) or config.minimum_precision_m < 0:
+        raise ValueError("minimum_precision_m must be finite and nonnegative")
+    check_cancelled()
     original_defocus_m = microscope.get_defocus()
     fov_m = microscope.get_fov()
     if not np.isfinite(fov_m) or fov_m <= 0:
         raise RuntimeError(f"Microscope returned an invalid FoV: {fov_m!r}")
 
-    target_precision_m = fov_m * config.precision_fov_fraction
+    target_precision_m = max(fov_m * config.precision_fov_fraction, config.minimum_precision_m)
     initial_half_range_m = (
         fov_m * config.initial_half_range_fov_fraction
     )
@@ -114,6 +132,7 @@ def autofocus(
     measurement_cache: dict[float, FocusMeasurement] = {}
 
     def evaluate(defocus_m: float) -> FocusMeasurement:
+        check_cancelled()
         defocus_m = float(defocus_m)
         cache_key = round(defocus_m, 18)
         cached = measurement_cache.get(cache_key)
@@ -122,7 +141,10 @@ def autofocus(
 
         microscope.set_defocus(defocus_m)
         if config.settle_time_s > 0:
-            time.sleep(config.settle_time_s)
+            deadline = time.monotonic() + config.settle_time_s
+            while time.monotonic() < deadline:
+                check_cancelled()
+                time.sleep(min(.05, max(0, deadline - time.monotonic())))
         scores = [
             metric(microscope.acquire_haadf())
             for _ in range(config.frames_per_position)
@@ -142,14 +164,19 @@ def autofocus(
         rounds = 0
         converged = False
         best: FocusMeasurement | None = None
+        bracket = None
+        expansions = 0
+        stop_reason = "round_budget"
+        limit = fov_m * config.max_search_offset_fov_fraction
 
         for round_index in range(config.max_rounds):
             rounds = round_index + 1
-            positions = np.linspace(
-                center_m - half_range_m,
-                center_m + half_range_m,
-                config.points_per_round,
-            )
+            check_cancelled()
+            lower = max(center_m - half_range_m, original_defocus_m - limit)
+            upper = min(center_m + half_range_m, original_defocus_m + limit)
+            if bracket is not None:
+                lower, upper = max(lower, bracket[0]), min(upper, bracket[1])
+            positions = np.linspace(lower, upper, config.points_per_round)
             final_step_m = float(positions[1] - positions[0])
             round_results = [
                 evaluate(float(position))
@@ -165,15 +192,26 @@ def autofocus(
                 or best_index == len(round_results) - 1
             )
 
-            if (
-                final_step_m <= target_precision_m
-                and not best_is_at_boundary
-            ):
+            if not best_is_at_boundary and bracket is None:
+                bracket = (float(positions[best_index - 1]), float(positions[best_index + 1]))
+            if final_step_m <= target_precision_m and bracket is not None:
                 converged = True
+                stop_reason = "precision_reached"
                 break
 
+            scores = np.asarray([item.score for item in round_results])
+            if not np.all(np.isfinite(scores)):
+                raise RuntimeError("Autofocus metric returned a nonfinite score")
+            scale = max(float(np.max(np.abs(scores))), np.finfo(float).eps)
+            if bracket is None and np.ptp(scores) <= config.score_relative_tolerance * scale:
+                stop_reason = "score_plateau"
+                break
             center_m = best.defocus_m
-            if best_is_at_boundary:
+            if best_is_at_boundary and bracket is None:
+                if expansions >= config.max_expansion_rounds or lower <= original_defocus_m - limit or upper >= original_defocus_m + limit:
+                    stop_reason = "expansion_limit"
+                    break
+                expansions += 1
                 # A boundary maximum does not bracket the focus peak.
                 # Expand towards it before attempting finer sampling.
                 half_range_m *= 2.0
@@ -183,10 +221,11 @@ def autofocus(
         if best is None:
             raise RuntimeError("Autofocus acquired no measurements")
 
-        best = max(measurements, key=lambda item: item.score)
+        best = max(measurements, key=lambda item: (item.score, -abs(item.defocus_m - original_defocus_m)))
         microscope.set_defocus(best.defocus_m)
-    except Exception:
-        microscope.set_defocus(original_defocus_m)
+    except BaseException:
+        with suspend_cancellation():
+            microscope.set_defocus(original_defocus_m)
         raise
 
     return AutofocusResult(
@@ -198,4 +237,5 @@ def autofocus(
         rounds=rounds,
         converged=converged,
         measurements=tuple(measurements),
+        stop_reason=stop_reason,
     )

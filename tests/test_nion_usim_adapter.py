@@ -107,6 +107,27 @@ class NionUSimAdapterTest(unittest.TestCase):
             microscope.center_fov_on_image_offset(100e-9, 0.0)
             np.testing.assert_allclose(microscope.get_stage_position(), (1222e-9, 179e-9))
 
+    def test_temporary_focus_resolution_restores_final_capture_after_failure(self):
+        api = _FakeAPI()
+        with NionUSimAdapter(api, image_size_px=1024) as microscope:
+            with self.assertRaisesRegex(RuntimeError, 'test failure'):
+                with microscope.acquisition_settings(image_size_px=512):
+                    microscope.acquire_haadf()
+                    self.assertEqual(api.hardware_source.last_parameters['pixel_size'], (512, 512))
+                    raise RuntimeError('test failure')
+            microscope.acquire_haadf()
+            self.assertEqual(api.hardware_source.last_parameters['pixel_size'], (1024, 1024))
+
+    def test_reference_positioning_moves_directly_and_handles_rotation(self):
+        from algorithms.Zoom2Fit import zoom_to_fit
+        api = _FakeAPI()
+        api.hardware_source.current_parameters['rotation_rad'] = np.pi / 2
+        with NionUSimAdapter(api) as microscope:
+            reference = microscope.get_stage_position()
+            zoom_to_fit(microscope, (100e-9, 0), 50e-9, reference_stage_position_m=reference)
+            zoom_to_fit(microscope, (100e-9, 50e-9), 50e-9, reference_stage_position_m=reference)
+            np.testing.assert_allclose(microscope.get_stage_position(), (1272e-9, 179e-9))
+
 
 if __name__ == "__main__":
     unittest.main()

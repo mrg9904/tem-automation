@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import time
+import threading
+from contextlib import contextmanager
+
+from adapters.cancellation import check_cancelled, suspend_cancellation
 from typing import Any
 
 import numpy as np
@@ -64,6 +68,18 @@ class NionUSimAdapter:
         self._instrument = None
         self._hardware_source = None
 
+    @contextmanager
+    def acquisition_settings(self, *, image_size_px, dwell_time_us=1.0):
+        """Temporarily lower acquisition cost, restoring final capture settings."""
+        if image_size_px <= 1 or not np.isfinite(dwell_time_us) or dwell_time_us <= 0:
+            raise ValueError("Invalid temporary acquisition settings")
+        previous = self._image_size_px, self._dwell_time_us
+        self._image_size_px, self._dwell_time_us = image_size_px, dwell_time_us
+        try:
+            yield
+        finally:
+            self._image_size_px, self._dwell_time_us = previous
+
     def get_defocus(self) -> float:
         instrument = self._require_instrument()
         return float(instrument.get_control_output("C10"))
@@ -115,7 +131,8 @@ class NionUSimAdapter:
         instrument.set_control_output("stage_position_m.x", float(x_m))
         instrument.set_control_output("stage_position_m.y", float(y_m))
 
-    def center_fov_on_image_offset(self, x_m: float, y_m: float) -> None:
+    def center_fov_on_image_offset(self, x_m: float, y_m: float, *,
+                                   reference_stage_position_m: tuple[float, float] | None = None) -> None:
         """Match uSim's double-click centering, including scan rotation."""
         if not np.all(np.isfinite([x_m, y_m])):
             raise ValueError("Image offsets must be finite")
@@ -126,7 +143,8 @@ class NionUSimAdapter:
         cos_angle, sin_angle = np.cos(rotation), np.sin(rotation)
         delta_x = cos_angle * x_m - sin_angle * y_m
         delta_y = sin_angle * x_m + cos_angle * y_m
-        stage_x, stage_y = self.get_stage_position()
+        stage_x, stage_y = (self.get_stage_position() if reference_stage_position_m is None
+                            else reference_stage_position_m)
         self.set_stage_position(stage_x - delta_x, stage_y - delta_y)
 
     def acquire_haadf(self) -> npt.NDArray[np.float32]:
@@ -138,16 +156,13 @@ class NionUSimAdapter:
         )
         frame_parameters["pixel_time_us"] = self._dwell_time_us
 
+        check_cancelled()
         try:
             # Facade.record can return image data slightly before Nion has
             # completely torn down the previous record task. Wait for the
             # hardware source to become idle before starting another frame.
             self._wait_until_recording_finishes(hardware_source)
-            frames = hardware_source.record(
-                frame_parameters,
-                None,
-                self._timeout_s,
-            )
+            frames = self._record_cancellable(hardware_source, frame_parameters)
             self._wait_until_recording_finishes(hardware_source)
         except Exception as exc:
             raise RuntimeError("uSim HAADF acquisition failed") from exc
@@ -162,6 +177,43 @@ class NionUSimAdapter:
                 f"Expected a 2-D HAADF image, received shape {data.shape}"
             )
         return data
+
+    def _record_cancellable(self, source, parameters):
+        pending = getattr(self, "_pending_record", None)
+        if pending is not None and pending.is_alive():
+            raise RuntimeError("Previous HAADF recording has not stopped; refusing another acquisition")
+        finished = threading.Event()
+        outcome = {}
+        def record():
+            try:
+                outcome["frames"] = source.record(parameters, None, self._timeout_s)
+            except BaseException as error:
+                outcome["error"] = error
+            finally:
+                finished.set()
+        worker = threading.Thread(target=record, daemon=True)
+        self._pending_record = worker
+        worker.start()
+        deadline = time.monotonic() + self._timeout_s
+        try:
+            while not finished.wait(.05):
+                check_cancelled()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("HAADF recording timed out")
+            check_cancelled()
+            if "error" in outcome:
+                raise outcome["error"]
+            return outcome["frames"]
+        except BaseException:
+            # Repeated abort handles cancellation racing recording startup.
+            stop_deadline = time.monotonic() + 3.0
+            while not finished.is_set():
+                abort = getattr(source, "abort_recording", None)
+                if callable(abort):
+                    abort()
+                if finished.wait(.05) or time.monotonic() >= stop_deadline:
+                    break
+            raise
 
     def _get_active_profile_frame_parameters(self) -> dict[str, Any]:
         """Return a copy of the currently selected scan profile settings."""
@@ -178,6 +230,7 @@ class NionUSimAdapter:
         """Wait until Nion has completely released its record task."""
         deadline = time.monotonic() + self._timeout_s
         while bool(hardware_source.is_recording):
+            check_cancelled()
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     "Timed out waiting for the uSim record task to finish"

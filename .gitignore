@@ -16,3 +16,7 @@ src/scripts/particle_workflow_results/
 
 # Historical output generated before the FindParticles rename.
 src/scripts/index_particles_results/
+
+tests/find_edge_results/
+
+src/scripts/particle_edge_workflow_results/

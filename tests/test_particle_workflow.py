@@ -38,8 +38,9 @@ class WorkflowMicroscope:
     def set_defocus(self, focus):
         self.focus = focus
 
-    def center_fov_on_image_offset(self, x, y):
-        self.stage = (self.stage[0] - x, self.stage[1] - y)
+    def center_fov_on_image_offset(self, x, y, *, reference_stage_position_m=None):
+        reference = self.stage if reference_stage_position_m is None else reference_stage_position_m
+        self.stage = (reference[0] - x, reference[1] - y)
         self.moves.append(self.stage)
 
     def acquire_haadf(self):

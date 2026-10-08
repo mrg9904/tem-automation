@@ -49,6 +49,7 @@ class FoVPositioningMicroscope(Protocol):
     def set_stage_position(self, x_m: float, y_m: float) -> None:
         ...
 
-    def center_fov_on_image_offset(self, x_m: float, y_m: float) -> None:
+    def center_fov_on_image_offset(self, x_m: float, y_m: float, *,
+                                   reference_stage_position_m: tuple[float, float] | None = None) -> None:
         """Center the FoV on an offset in the current image axes."""
         ...

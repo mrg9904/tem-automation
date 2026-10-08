@@ -146,7 +146,7 @@ selecting another particle. A scalar size assumes a square acquisition FoV.
 
 Add `src/scripts/usim_particle_workflow.py` to Nion Swift's Scripts panel.
 Select the overview sample/FoV and run it. The modular workflow composes
-`find_particles`, `zoom_to_fit`, and `autofocus`; it acquires 512 x 512 images.
+`find_particles`, `zoom_to_fit`, and `autofocus`; it uses 512 x 512 overview/focus images and 1024 x 1024 final captures.
 No initial overview autofocus is performed: detection uses the current focus.
 
 Each run creates `src/scripts/particle_workflow_results/<timestamp>/`:
@@ -179,3 +179,97 @@ config = ParticleWorkflowConfig(padding=1.2, continue_on_error=False,
                                autofocus=AutofocusConfig(max_rounds=12))
 run_particle_workflow(microscope, "output_directory", config=config)
 ```
+
+## Find particle edges and acquisition boxes
+
+`algorithms/FindEdge.py` provides `find_edge(microscope, box_fov_m)` and
+`find_edge_in_image(image, fov_m=..., box_fov_m=..., particle_id=None)`.
+It uses FindParticles segmentation, traces ordered pixel-cell outlines and
+covers the selected boundaries with edge-centered squares by default (or a shared square grid). Grid phases are
+searched to reduce box count; in the optional grid mode distinct boxes have no area overlap. This is a
+heuristic covering, not a globally optimal minimum-box solution.
+
+`result.box_centers_m` is an N x 2 array of image-axis (x, y) offsets in meters.
+`result.boxes` contains IDs, pixel centers, meter offsets, box FoV and a flag
+for boxes extending outside the image. Use these centers with Zoom2Fit from
+the same reference view. `result.save("edge.npz")` records original data,
+ordered boundary points (pixels and meter offsets), contour offsets and
+particle IDs, and boxes; `result.save_overlay("edge.png")` draws cyan edges,
+yellow acquisition squares and red centers. Particle IDs refer to detection
+in the supplied image, rather than earlier overview IDs. Holes are filled by
+default; set outer_edges_only=False to include internal boundaries.
+Frame-touching contours include the image cut and are flagged as incomplete
+physical outlines. Boxes smaller than one image pixel are rejected.
+
+Run `python tests/preview_find_edge.py` in nionswift-dev to generate a 10 x 10 nm
+box preview using the latest saved particle #1 close-up. Outputs are under
+`tests/find_edge_results/<run>/`. Use `--source` and `--output` to override.
+
+## Particle #1 edge autofocus workflow (50 nm boxes)
+
+Add `src/scripts/usim_particle_edge_workflow.py` to Nion Swift's Scripts panel.
+Start at the overview containing your intended particle #1. It detects the
+current view, centers/fits overview particle #1 with 10% margin, and acquires
+a close-up. It selects the region containing the close-up image center (or
+the nearest centroid), runs FindEdge with 50 x 50 nm boxes, and for every box
+runs Zoom2Fit with no extra margin, autofocus, and a separate HAADF capture.
+Overview and focus images are 512 x 512; final per-box photographs are 1024 x 1024. The script needs no file from a previous run.
+
+Results: `src/scripts/particle_edge_workflow_results/<timestamp>/`:
+
+- `overview/`: detected particles and the annotated overview image.
+- `particle_0001/`: zoom/reference metadata, `find_edge.npz`, and
+  `haadf_edge_boxes.png` for visual checking.
+- `particle_0001/edge_box_0001/`, etc.: `haadf.png`, `haadf.npz` (particle ID 1,
+  actual FoV, stage, defocus and float image), autofocus arrays/JSON,
+  zoom metadata and `box.json` (box ID and center).
+- `run.json`: every box's outcome and restoration state.
+
+Each box is anchored to the same particle close-up baseline and reached
+directly from the preceding box, preventing accumulated movement. On completion or failure the ORIGINAL overview stage,
+FoV and defocus are restored. Individual box errors are logged and processing
+continues; nonconverged autofocus captures best measured focus and is flagged.
+Do not change the sample, rotation, profile or other microscope controls
+while running. Particle #1 uses FindParticles overview numbering, not an
+arbitrary specimen ID. Frame-touching edges are flagged in saved metadata.
+Customize `ParticleEdgeWorkflowConfig` for other box sizes or focus parameters.
+
+## Edge centering, focus stability, and stopping a workflow
+
+FindEdge now defaults to centers on the traced edge. Covering curved edges
+with edge-centered squares can require some overlap; coverage is maintained
+and overlap is penalized in the greedy selection. Set `center_on_edge=False`
+for the original zero-overlap grid, whose centers need not lie on the edge.
+Autofocus averages three frames by median, uses mean-intensity normalization,
+limits range expansion, and never expands outside an already bracketed peak.
+Flat scores stop with `score_plateau`; exhausted expansion stops with
+`expansion_limit`. These are nonconverged results saved explicitly.
+The edge workflow starts with a smaller +/- half-FoV focus search.
+
+Click Nion Swift's Cancel to request a cooperative stop. Acquisition waits
+poll cancellation and attempt to abort the active record. The current run
+report becomes `cancelled`, existing results are retained, and stage/FoV/focus
+restoration is attempted with cancellation suspended. Alternatively create an
+empty file named `STOP` inside the timestamped run directory printed by the
+script. This requests the same stop without using the Scripts dialog.
+Startup and device-driver shutdown can still have device-dependent delays;
+these changes have automated cancellation tests but need live GUI verification.
+
+The edge workflow now uses a 5 nm minimum focus precision, 5 search positions
+per round, and one frame per position. First-box search starts at +/- 4 FoV;
+after a converged box, the next starts at that best focus with +/- half FoV.
+Focus acquisition uses 512 x 512 pixels; final captures use
+1024 x 1024. Overview and edge detection remain 512 x 512. Acquisition settings are restored even on failure or cancellation.
+A plateau near a good focus previously counted as nonconvergence when the
+requested 0.5 nm precision was finer than the score could resolve.
+
+Edge boxes are now numbered along each traced contour's arclength, starting
+near the contour's top-left and traversing its ordered outline (clockwise for
+outer boundaries in image coordinates). The table stores `contour_id` and
+`arc_length_px`; FindEdge archive schema is now version 2. The overlay shows
+box IDs. Each contour is processed consecutively; separate contours are
+separate paths. The edge workflow moves directly between absolute targets
+computed from the saved particle reference. It no longer returns the stage
+to the particle center between boxes. The original overview is restored only
+at the end. This reduces unnecessary direction reversals but does not calibrate
+or compensate mechanical stage hysteresis.

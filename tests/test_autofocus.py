@@ -94,6 +94,49 @@ class AutofocusTest(unittest.TestCase):
         self.assertEqual(result.rounds, 2)
         self.assertAlmostEqual(result.best_defocus_m, 3 * microscope.get_fov(), delta=1e-18)
 
+    def test_flat_scores_stop_without_expansion_or_focus_drift(self):
+        microscope = FakeMicroscope(initial_defocus_m=30e-9)
+        result = autofocus(microscope, metric=lambda image: 1.0)
+        self.assertEqual(result.rounds, 1)
+        self.assertEqual(result.stop_reason, 'score_plateau')
+        self.assertAlmostEqual(result.best_defocus_m, 30e-9, delta=1e-18)
+        self.assertFalse(result.converged)
+
+    def test_monotone_metric_has_a_bounded_search(self):
+        microscope = FakeMicroscope(initial_defocus_m=0.)
+        result = autofocus(microscope, config=AutofocusConfig(max_expansion_rounds=1),
+                           metric=lambda image: microscope.get_defocus())
+        self.assertEqual(result.stop_reason, 'expansion_limit')
+        self.assertEqual(result.rounds, 2)
+        self.assertFalse(result.converged)
+        self.assertLessEqual(max(abs(m.defocus_m) for m in result.measurements), 3.01 * microscope.get_fov())
+
+    def test_bracketed_peak_never_reexpands_on_later_endpoint_scores(self):
+        microscope = FakeMicroscope(initial_defocus_m=0.)
+        count = 0
+        def noisy_metric(image):
+            nonlocal count
+            count += 1
+            x = microscope.get_defocus() / microscope.get_fov()
+            return -x*x if count <= 7 else x + 2
+        result = autofocus(microscope,
+            config=AutofocusConfig(frames_per_position=1, score_relative_tolerance=0), metric=noisy_metric)
+        self.assertLessEqual(max(abs(m.defocus_m) for m in result.measurements[7:]), microscope.get_fov() / 3 + 1e-18)
+
+    def test_edge_focus_near_130nm_converges_with_practical_precision(self):
+        microscope = FakeMicroscope(initial_defocus_m=0.)
+        calls = 0
+        def peak(image):
+            nonlocal calls
+            calls += 1
+            return 1.0 - ((microscope.get_defocus() - 130e-9) / 200e-9)**2
+        result = autofocus(microscope, metric=peak,
+            config=AutofocusConfig(initial_half_range_fov_fraction=2, points_per_round=5,
+                frames_per_position=1, minimum_precision_m=5e-9))
+        self.assertTrue(result.converged)
+        self.assertAlmostEqual(result.best_defocus_m, 130e-9, delta=5e-9)
+        self.assertLessEqual(calls, 25)
+
 
 if __name__ == "__main__":
     unittest.main()

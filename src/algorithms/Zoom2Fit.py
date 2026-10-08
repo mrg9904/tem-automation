@@ -24,6 +24,7 @@ def zoom_to_fit(
     diameter_m: float,
     *,
     padding: float = 1.0,
+    reference_stage_position_m: tuple[float, float] | None = None,
 ) -> Zoom2FitResult:
     """Center on (x, y) relative to the CURRENT image center, then fit FoV.
 
@@ -35,6 +36,10 @@ def zoom_to_fit(
 
     Offsets refer to the image BEFORE this action. Do not reuse an old image's
     offsets after moving the stage, changing scan center, or rotating the scan.
+    reference_stage_position_m optionally anchors offsets to a saved reference
+    stage position. The adapter moves directly to that absolute target without
+    revisiting the reference. Scan rotation/center and beam shift must remain
+    unchanged relative to the reference image.
     On failure, attempt to restore both original FoV and stage position.
     """
     center = np.asarray(center_m, dtype=np.float64)
@@ -47,12 +52,20 @@ def zoom_to_fit(
     target_fov = float(diameter_m) * float(padding)
     if not np.isfinite(target_fov):
         raise ValueError("Requested FoV must be finite")
+    if reference_stage_position_m is not None:
+        reference = np.asarray(reference_stage_position_m, dtype=float)
+        if reference.shape != (2,) or not np.all(np.isfinite(reference)):
+            raise ValueError("reference_stage_position_m must contain finite (x, y)")
     original_fov = microscope.get_fov()
     original_stage = microscope.get_stage_position()
     if not np.isfinite(original_fov) or original_fov <= 0 or not np.all(np.isfinite(original_stage)):
         raise RuntimeError("Microscope returned an invalid original FoV or stage position")
     try:
-        microscope.center_fov_on_image_offset(float(center[0]), float(center[1]))
+        if reference_stage_position_m is None:
+            microscope.center_fov_on_image_offset(float(center[0]), float(center[1]))
+        else:
+            microscope.center_fov_on_image_offset(float(center[0]), float(center[1]),
+                reference_stage_position_m=tuple(reference))
         microscope.set_fov(target_fov)
         actual_fov = float(microscope.get_fov())
         actual_stage = microscope.get_stage_position()

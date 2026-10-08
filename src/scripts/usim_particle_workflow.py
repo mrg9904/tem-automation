@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from contextlib import nullcontext
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -12,6 +13,8 @@ from PIL import Image
 
 from scripts import __file__ as scripts_package_file
 from adapters.nion_usim import NionUSimAdapter
+from adapters.cancellation import (WorkflowCancelled, check_cancelled, set_stop_file, cancellation_scope,
+                                   suspend_cancellation, nion_cancel_callback)
 from algorithms.FindParticles import FindParticlesConfig, find_particles
 from algorithms.Zoom2Fit import zoom_to_fit
 from algorithms.autofocus import AutofocusConfig, autofocus
@@ -20,6 +23,8 @@ from algorithms.autofocus import AutofocusConfig, autofocus
 @dataclass(frozen=True)
 class ParticleWorkflowConfig:
     padding: float = 1.1
+    autofocus_image_size_px: int = 512
+    capture_image_size_px: int = 1024
     continue_on_error: bool = True
     finding: FindParticlesConfig = field(default_factory=FindParticlesConfig)
     autofocus: AutofocusConfig = field(default_factory=AutofocusConfig)
@@ -39,7 +44,7 @@ class InstrumentState:
         return state
 
 
-def _restore_state(microscope, state):
+def _restore_state_unchecked(microscope, state):
     """Attempt all restorations, even if one setting fails."""
     errors = []
     for name, restore in (
@@ -53,6 +58,11 @@ def _restore_state(microscope, state):
             errors.append(f"{name}: {error}")
     if errors:
         raise RuntimeError("Could not restore overview state: " + "; ".join(errors))
+
+
+def _restore_state(microscope, state):
+    with suspend_cancellation():
+        _restore_state_unchecked(microscope, state)
 
 
 def _json_value(value):
@@ -81,9 +91,12 @@ def _capture_overview(microscope, directory, config):
     return result
 
 
-def _save_capture(microscope, directory, particle_id):
+def _save_capture(microscope, directory, particle_id, *, image_size_px=1024):
     """Save quantitative image data separately from the display-scaled PNG."""
-    image = np.asarray(microscope.acquire_haadf(), dtype=np.float32)
+    settings = getattr(microscope, "acquisition_settings", None)
+    context = settings(image_size_px=image_size_px, dwell_time_us=1.0) if callable(settings) else nullcontext()
+    with context:
+        image = np.asarray(microscope.acquire_haadf(), dtype=np.float32)
     if image.ndim != 2 or not image.size or not np.all(np.isfinite(image)):
         raise RuntimeError("Invalid final HAADF image")
     state = InstrumentState.read(microscope)
@@ -98,19 +111,26 @@ def _save_capture(microscope, directory, particle_id):
     return state
 
 
-def _process_particle(microscope, particle, directory, config):
+def _process_particle(microscope, particle, directory, config, *, reference_stage_position_m=None):
     """Compose the positioning and autofocus algorithms for one particle."""
+    check_cancelled()
     zoom = zoom_to_fit(microscope,
         (float(particle["offset_x_m"]), float(particle["offset_y_m"])),
-        float(particle["circle_diameter_m"]), padding=config.padding)
+        float(particle["circle_diameter_m"]), padding=config.padding,
+        reference_stage_position_m=reference_stage_position_m)
     _write_json(directory / "zoom.json", asdict(zoom))
-    focus = autofocus(microscope, config=config.autofocus)
+    settings = getattr(microscope, "acquisition_settings", None)
+    context = (settings(image_size_px=config.autofocus_image_size_px, dwell_time_us=1.0)
+               if callable(settings) else nullcontext())
+    with context:
+        focus = autofocus(microscope, config=config.autofocus)
     _write_json(directory / "autofocus.json", asdict(focus))
     np.savez_compressed(directory / "autofocus.npz",
         defocus_m=np.asarray([measurement.defocus_m for measurement in focus.measurements]),
         score=np.asarray([measurement.score for measurement in focus.measurements]),
         best_defocus_m=np.float64(focus.best_defocus_m), converged=np.bool_(focus.converged))
-    state = _save_capture(microscope, directory, int(particle["id"]))
+    state = _save_capture(microscope, directory, int(particle["id"]),
+                          image_size_px=config.capture_image_size_px)
     return {"status": "captured" if focus.converged else "captured_unconverged",
             "autofocus_converged": focus.converged, "capture_state": asdict(state)}
 
@@ -134,12 +154,14 @@ def run_particle_workflow(microscope, output_root, *, config=ParticleWorkflowCon
     manifest_path = run_directory / "run.json"
     _write_json(manifest_path, manifest)
     print(f"Particle workflow results: {run_directory}")
+    previous_stop_file = set_stop_file(run_directory / "STOP")
     try:
         overview = _capture_overview(microscope, run_directory / "overview", config)
         manifest["particle_count"] = len(overview.particles)
         _write_json(manifest_path, manifest)
         print(f"Detected {len(overview.particles)} particles")
         for particle in overview.particles:
+            check_cancelled()
             # Re-establish the acquisition baseline before applying overview offsets.
             _restore_state(microscope, initial)
             particle_id = int(particle["id"])
@@ -167,9 +189,14 @@ def run_particle_workflow(microscope, output_root, *, config=ParticleWorkflowCon
         manifest["status"] = ("completed_with_errors" if "error" in statuses else
                               "completed_with_unconverged_focus" if "captured_unconverged" in statuses else "completed")
     except BaseException as error:
-        manifest.update(status="aborted", error=f"{type(error).__name__}: {error}")
+        for active in manifest['particles']:
+            if 'status' not in active:
+                active['status'] = 'cancelled' if isinstance(error, WorkflowCancelled) else 'aborted'
+                _write_json(run_directory / active['directory'] / 'particle.json', active)
+        manifest.update(status="cancelled" if isinstance(error, WorkflowCancelled) else "aborted", error=f"{type(error).__name__}: {error}")
         raise
     finally:
+        set_stop_file(previous_stop_file)
         try:
             _restore_state(microscope, initial)
             manifest["state_restored"] = True
@@ -186,4 +213,8 @@ def script_main(api_broker):
     api = api_broker.get_api(version="~1.0")
     output_root = Path(scripts_package_file).resolve().parent / "particle_workflow_results"
     with NionUSimAdapter(api, image_size_px=512) as microscope:
-        run_particle_workflow(microscope, output_root)
+        try:
+            with cancellation_scope(nion_cancel_callback(print)):
+                run_particle_workflow(microscope, output_root)
+        except WorkflowCancelled:
+            print("Workflow stopped; acquired results saved and restoration attempted.")
