@@ -13,6 +13,7 @@ src/
   algorithms/
     FindParticles.py        particle detection and indexing
     FindEdge.py             ordered contour tracing and edge boxes
+    FindWindow.py           square grid opening geometry and scan anchors
     Zoom2Fit.py             positioning and FoV fitting
     autofocus.py            focus search and configuration validation
     FindROI.py              stable public ROI API
@@ -43,6 +44,40 @@ python -m unittest discover -s tests -v
 
 Dependencies: Python >=3.10, NumPy >=1.24, SciPy >=1.10 and Pillow >=10.1.
 There is no PyTorch or pretrained-model download requirement.
+
+## Find a grid window from the Ronchigram
+
+On branch `findWindow`, import `src/scripts/usim_find_window.py` in Nion Swift.
+It selects `1000CathodeParticleOnCarbon`, sets Stage X=938 nm, Y=-6820 nm,
+Z=600 um and defocus=0, and parks the probe at the scan center. The updated
+uSim startup also uses this sample and its initial position; restart Swift to
+apply startup changes. The uSim changes are in its `build_cathode` checkout.
+
+`algorithms.FindWindow.find_window_in_image` uses only the image and a square
+shape constraint. It tests both contrast polarities, fills internal holes,
+rejects clipped components, and fits a square to the outer contour. It selects
+the complete square nearest the detector image center. It does not read STL
+metadata, assume a 54 um size, or assume a 60 degree rotation. On a uniform
+grid, geometry alone cannot identify a particular grid index: positioning the
+desired opening near image center establishes which window is selected.
+
+Results are under `src/scripts/find_window_results/<timestamp>/`:
+`ronchigram_window.png` labels the four corners, center, side and angle;
+`find_window.npz` preserves image/geometry/JSON metadata, and `window.json`
+records detector geometry and calibrated Stage targets. The adapter uses the
+native Ronchigram ray mapping, including display rotation and defocus sign,
+to convert the fitted points. No scan FoV is used as camera magnification.
+The anchor includes a normalized bilinear Stage patch for future subdivisions;
+interior positions assume weak ray distortion and are not yet a scanning workflow.
+
+Screen angles are clockwise from x right toward y down. Detector angles use
+the signed angular calibrations. Both are modulo 90 degrees because a square
+has four equivalent orientations. A complete visible opening and adequate
+contrast are required; substantial tilt or aberrations can distort a square
+enough to reject it rather than silently infer unsupported geometry.
+
+`python -m tests.preview_find_window` acquires a noisy simulated Ronchigram at
+the requested view and saves a local labeled example in `find_window_results/preview`.
 
 ## Run the edge experiment
 
