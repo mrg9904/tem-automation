@@ -5,11 +5,13 @@ coordinates relative to the FoV center, not absolute stage coordinates.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
+import json
+from adapters.cancellation import check_cancelled
 from scipy import ndimage
 from PIL import Image, ImageDraw, ImageFont
 
@@ -31,13 +33,20 @@ PARTICLE_DTYPE = np.dtype([
 
 @dataclass(frozen=True)
 class FindParticlesConfig:
-    """Threshold applies after smoothing; None selects an Otsu threshold."""
+    """Explicit thresholds override local SNR; 'otsu' retains legacy behavior."""
 
     gaussian_sigma_px: float = 1.0
     min_area_px: int = 16
     threshold: float | None = None
     bright_particles: bool = True
     exclude_edge_particles: bool = False
+    threshold_method: str = "local_snr"
+    background_sigma_m: float = 160e-9
+    background_clip_percentile: float = 85.
+    seed_snr: float = 5.
+    grow_snr: float = 3.
+    recover_edge_centers: bool = True
+    maximum_context_expansions: int = 2
 
 
 @dataclass(frozen=True)
@@ -48,6 +57,18 @@ class FindParticlesResult:
     fov_m: float
     threshold: float
     config: FindParticlesConfig
+    background: np.ndarray | None = None
+    noise_scale: np.ndarray | None = None
+    segmentation_method: str = "otsu"
+    center_status: np.ndarray | None = None
+    visible_centers_xy_px: np.ndarray | None = None
+    full_segmented_area_m2: np.ndarray | None = None
+    context_metadata: tuple = ()
+
+    @property
+    def center_statuses(self):
+        return (np.where(self.particles['touches_edge'], 'clipped', 'complete')
+                if self.center_status is None else self.center_status)
 
     def save(self, path: str | Path) -> Path:
         """Save a versioned archive that loads with allow_pickle=False.
@@ -68,10 +89,24 @@ class FindParticlesResult:
                 fov_m=np.float64(self.fov_m),
                 pixel_size_m=np.float64(self.fov_m / max(self.image.shape)),
                 threshold=np.float64(self.threshold),
+                threshold_role=np.asarray('bright-core seed threshold; local_snr uses background/noise maps' if self.segmentation_method == 'local_snr' else 'global segmentation threshold'),
                 gaussian_sigma_px=np.float64(self.config.gaussian_sigma_px),
                 min_area_px=np.int64(self.config.min_area_px),
                 bright_particles=np.bool_(self.config.bright_particles),
                 exclude_edge_particles=np.bool_(self.config.exclude_edge_particles),
+                threshold_method=np.asarray(self.segmentation_method),
+                background=np.asarray(self.background if self.background is not None else np.empty((0, 0))),
+                noise_scale=np.asarray(self.noise_scale if self.noise_scale is not None else np.empty((0, 0))),
+                background_sigma_m=np.float64(self.config.background_sigma_m),
+                background_clip_percentile=np.float64(self.config.background_clip_percentile),
+                seed_snr=np.float64(self.config.seed_snr), grow_snr=np.float64(self.config.grow_snr),
+                center_status=self.center_statuses,
+                visible_centers_xy_px=(np.column_stack((self.particles['center_x_px'], self.particles['center_y_px']))
+                    if self.visible_centers_xy_px is None else self.visible_centers_xy_px),
+                full_segmented_area_m2=(np.where(self.particles['touches_edge'], np.nan,
+                    self.particles['area_px']*(self.fov_m/max(self.image.shape))**2)
+                    if self.full_segmented_area_m2 is None else self.full_segmented_area_m2),
+                context_metadata_json=np.asarray(json.dumps(self.context_metadata)),
                 coordinate_system=np.asarray("image_axes: x right, y down; origin FoV center"),
             )
         return path
@@ -86,11 +121,10 @@ class FindParticlesResult:
         """
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
-        low, high = float(self.image.min()), float(self.image.max())
-        if high > low:
-            pixels = np.rint(np.clip((self.image.astype(np.float64) - low) / (high - low), 0, 1) * 255).astype(np.uint8)
-        else:
-            pixels = np.zeros(self.image.shape, dtype=np.uint8)
+        from algorithms.AutoBC import auto_bc
+        tone = auto_bc(self.image, self.labels > 0)
+        pixels = tone.render(self.image)
+        (directory/'auto_bc.json').write_text(json.dumps(tone.metadata(), indent=2), encoding='utf-8')
         raw = Image.fromarray(pixels)
         raw_path = directory / "haadf.png"
         annotated_path = directory / "haadf_annotated.png"
@@ -130,18 +164,96 @@ def _otsu_threshold(image: np.ndarray) -> float:
     return float(edges[int(np.argmax(variance)) + 1])
 
 
+def _local_snr_components(smoothed, fov_m, config, otsu_mask):
+    """Robust local background and hysteresis, retaining separate bright cores.
+
+    Clip high signals only for background estimation. Local variance includes
+    substrate texture; a robust high-pass floor avoids treating noise as signal.
+    Watershed grows both strong and weak seeds without joining existing cores.
+    """
+    oriented = smoothed if config.bright_particles else -smoothed
+    if np.median(np.abs(oriented-np.median(oriented))) <= np.finfo(float).eps*max(1., float(np.ptp(oriented))):
+        components, count = ndimage.label(otsu_mask, structure=np.ones((3, 3)))
+        return components, count, None, None, 'otsu_constant_background'
+    pixel_size_m = fov_m/max(smoothed.shape)
+    sigma = np.clip(config.background_sigma_m/pixel_size_m, 2., max(2., min(smoothed.shape)/8))
+    # Remove illumination slope before clipping strong signals. Otherwise a
+    # background ceiling would mistake the bright end of a slope for particles.
+    stride = max(1, int(round(sigma/4)))
+    yy, xx = np.mgrid[:oriented.shape[0], :oriented.shape[1]]
+    xx = xx/max(1, oriented.shape[1]-1)-.5
+    yy = yy/max(1, oriented.shape[0]-1)-.5
+    design = np.column_stack((np.ones(xx[::stride, ::stride].size),
+        xx[::stride, ::stride].ravel(), yy[::stride, ::stride].ravel()))
+    samples = oriented[::stride, ::stride].ravel()
+    approved = np.ones(len(samples), dtype=bool)
+    for _ in range(5):
+        coefficients = np.linalg.lstsq(design[approved], samples[approved], rcond=None)[0]
+        error = samples-design@coefficients
+        median = np.median(error[approved])
+        spread = 1.4826*np.median(np.abs(error[approved]-median))
+        next_approved = error <= median+3*max(float(spread), np.finfo(float).eps)
+        if next_approved.sum() < 3 or np.array_equal(approved, next_approved):
+            break
+        approved = next_approved
+    plane = coefficients[0]+coefficients[1]*xx+coefficients[2]*yy
+    detrended = oriented-plane
+    capped = np.minimum(detrended, np.percentile(detrended, config.background_clip_percentile))
+    # Exact constant-background inputs have no measurable noise scale. Retain
+    # established Otsu behavior rather than divide numerical tails by zero.
+    if np.ptp(capped) <= np.finfo(float).eps*max(1., float(np.ptp(oriented))):
+        components, count = ndimage.label(otsu_mask, structure=np.ones((3, 3)))
+        return components, count, None, None, 'otsu_constant_background'
+    background = ndimage.gaussian_filter(capped, sigma)
+    variance = np.maximum(ndimage.gaussian_filter(capped*capped, sigma)-background*background, 0.)
+    highpass = oriented-ndimage.gaussian_filter(oriented, 3.)
+    floor = 1.4826*np.median(np.abs(highpass-np.median(highpass)))
+    floor = max(float(floor), np.finfo(float).eps*max(1., float(np.ptp(oriented))))
+    noise = np.maximum(np.sqrt(variance), floor)
+    background += plane
+    snr = (oriented-background)/noise
+    growth = snr > config.grow_snr
+    seeds, seed_count = ndimage.label(snr > config.seed_snr, structure=np.ones((3, 3)))
+    strong, strong_count = ndimage.label(otsu_mask, structure=np.ones((3, 3)))
+    areas = np.bincount(strong.ravel(), minlength=strong_count+1)
+    valid = np.flatnonzero(areas >= config.min_area_px)
+    valid = valid[valid != 0]
+    seeded_ids = np.unique(strong[snr > config.seed_snr])
+    valid = valid[np.isin(valid, seeded_ids)]
+    mapping = np.zeros(strong_count+1, dtype=np.int32)
+    mapping[valid] = np.arange(1, len(valid)+1)
+    markers = mapping[strong]
+    growth |= markers > 0
+    count = len(valid)
+    seed_areas = np.bincount(seeds.ravel(), minlength=seed_count+1)
+    seed_regions = ndimage.find_objects(seeds)
+    for index, region in enumerate(seed_regions, 1):
+        if region is None or seed_areas[index] < 3:
+            continue
+        local = seeds[region] == index
+        if not np.any(markers[region][local]):
+            count += 1
+            markers[region][local] = count
+    markers[~growth] = -1
+    cost = np.rint(255*(1-np.clip(snr/(2*config.seed_snr), 0, 1))).astype(np.uint8)
+    components = ndimage.watershed_ift(cost, markers.astype(np.int32))
+    components = np.where(growth & (components > 0), components, 0).astype(np.int32)
+    return components, count, background if config.bright_particles else -background, noise, 'local_snr'
+
+
 def find_particles_in_image(
     image: npt.ArrayLike,
     *,
     fov_m: float,
     config: FindParticlesConfig = FindParticlesConfig(),
 ) -> FindParticlesResult:
-    """Segment particles using Gaussian smoothing and 8-connected regions.
+    """Find bright or dark particles with locally normalized contrast by default.
 
     FoV is the image's longest-side extent in meters, with square pixels.
     Geometric centroids are sorted top-to-bottom then left-to-right; IDs
     start at 1 and correspond to values in labels (0 is background).
-    Touching particles form one region. Edge regions are retained and flagged
+    Watershed retains separate strong cores when weak borders touch. Connected
+    particles without distinct seeds can still form one region. Edge regions are retained and flagged
     by default, because their full centers cannot be recovered from this FoV.
     """
     if not np.isfinite(fov_m) or fov_m <= 0:
@@ -152,6 +264,12 @@ def find_particles_in_image(
         raise ValueError("min_area_px must be a positive integer")
     if config.threshold is not None and not np.isfinite(config.threshold):
         raise ValueError("threshold must be finite")
+    if config.threshold_method not in ('otsu', 'local_snr'):
+        raise ValueError('threshold_method must be otsu or local_snr')
+    if isinstance(config.maximum_context_expansions, bool) or not isinstance(config.maximum_context_expansions, (int, np.integer)) or config.maximum_context_expansions < 0:
+        raise ValueError('maximum_context_expansions must be a nonnegative integer')
+    if not np.isfinite([config.background_sigma_m, config.background_clip_percentile, config.seed_snr, config.grow_snr]).all() or config.background_sigma_m <= 0 or not 50 < config.background_clip_percentile < 100 or not 0 < config.grow_snr < config.seed_snr:
+        raise ValueError('Invalid local background/SNR configuration')
     raw = np.asarray(image)
     if raw.ndim != 2 or 0 in raw.shape or np.iscomplexobj(raw):
         raise ValueError("image must be a nonempty real 2-D array")
@@ -163,7 +281,13 @@ def find_particles_in_image(
     if threshold is None:
         threshold = float(smoothed.flat[0]) if np.ptp(smoothed) == 0 else _otsu_threshold(smoothed)
     mask = smoothed > threshold if config.bright_particles else smoothed < threshold
-    components, count = ndimage.label(mask, structure=np.ones((3, 3), dtype=np.int8))
+    background = noise = None
+    method = 'explicit' if config.threshold is not None else 'otsu'
+    if config.threshold is None and config.threshold_method == 'local_snr' and np.ptp(smoothed) > 0:
+        components, count, background, noise, method = _local_snr_components(smoothed, fov_m, config, mask)
+        mask = components > 0
+    else:
+        components, count = ndimage.label(mask, structure=np.ones((3, 3), dtype=np.int8))
     areas = np.bincount(components.ravel(), minlength=count + 1)
     edge_ids = set(np.concatenate((components[0], components[-1], components[:, 0], components[:, -1])).tolist())
     kept = [i for i in range(1, count + 1)
@@ -188,7 +312,8 @@ def find_particles_in_image(
             areas[component_id], diameter_px, diameter_px * pixel_size_m,
             component_id in edge_ids,
         )
-    return FindParticlesResult(particles, mapping[components], image, float(fov_m), float(threshold), config)
+    return FindParticlesResult(particles, mapping[components], image, float(fov_m), float(threshold), config,
+                               background, noise, method)
 
 
 def find_particles(
@@ -204,5 +329,111 @@ def find_particles(
     """
     fov_m = microscope.get_fov()
     result = find_particles_in_image(microscope.acquire_haadf(), fov_m=fov_m, config=config)
+    output_path = Path(output_path)
+    capture_context = getattr(microscope, 'acquire_particle_context', None)
+    if config.recover_edge_centers and np.any(result.particles['touches_edge']) and callable(capture_context):
+        for attempt in range(1, config.maximum_context_expansions+1):
+            check_cancelled()
+            if not np.isin(result.center_statuses, ['clipped', 'context_clipped']).any():
+                break
+            image, context_fov = capture_context(fov_m=fov_m*2**attempt,
+                reference_fov_m=fov_m, reference_shape_px=result.image.shape)
+            context = find_particles_in_image(image, fov_m=context_fov, config=config)
+            result, targets = recover_particle_centers(result, context)
+            directory = output_path.parent/(output_path.stem+f'_context_{attempt:02d}')
+            directory.mkdir(parents=True, exist_ok=True)
+            context.save(directory/'context_particles.npz')
+            targets.save(directory/'matched_particles.npz')
+            targets.save_images(directory)
+            # Mark the original image extent on the larger context view.
+            annotated = directory/'haadf_annotated.png'
+            with Image.open(annotated) as source:
+                picture = source.convert('RGB')
+            draw = ImageDraw.Draw(picture)
+            ratio = (fov_m/max(result.image.shape))/(context_fov/max(context.image.shape))
+            h, w = result.image.shape
+            cy, cx = (np.asarray(context.image.shape)-1)/2
+            draw.rectangle((cx-w*ratio/2, cy-h*ratio/2, cx+w*ratio/2, cy+h*ratio/2),
+                           outline='yellow', width=3)
+            draw.text((8, 8), 'Yellow box: original FoV; IDs match original particles',
+                      fill='yellow', stroke_width=1, stroke_fill='black')
+            picture.save(annotated)
     result.save(output_path)
     return result
+
+
+def recover_particle_centers(result, context):
+    """Match visible masks to complete particles in a larger, concentric image.
+
+    Images must share physical center and scan axes. Overlap voting requires
+    at least half the original foreground and a unique one-to-one match.
+    IDs and visible areas are preserved; recovered centers may lie outside
+    the original image. No out-of-frame shape is guessed from a cropped mask.
+    """
+    if context.fov_m <= result.fov_m:
+        raise ValueError('Particle context must have a larger FoV')
+    original_pixel = result.fov_m/max(result.image.shape)
+    context_pixel = context.fov_m/max(context.image.shape)
+    yy, xx = np.mgrid[:result.image.shape[0], :result.image.shape[1]]
+    mapped = ndimage.map_coordinates(context.labels,
+        [(yy+.5-result.image.shape[0]/2)*original_pixel/context_pixel+context.image.shape[0]/2-.5,
+         (xx+.5-result.image.shape[1]/2)*original_pixel/context_pixel+context.image.shape[1]/2-.5],
+        order=0, mode='constant', cval=0)
+    matches = {}
+    for particle in result.particles:
+        check_cancelled()
+        selected = mapped[result.labels == particle['id']]
+        votes = np.bincount(selected, minlength=len(context.particles)+1)
+        votes[0] = 0
+        winner = int(votes.argmax())
+        ranked = np.sort(votes[1:])
+        if winner and votes[winner] >= .5*len(selected) and (len(ranked) < 2 or ranked[-2] < .25*ranked[-1]):
+            matches[int(particle['id'])] = winner
+    duplicate = {candidate for candidate in matches.values() if list(matches.values()).count(candidate) > 1}
+    particles = result.particles.copy()
+    statuses = result.center_statuses.astype('<U24').copy()
+    visible = (np.column_stack((particles['center_x_px'], particles['center_y_px']))
+               if result.visible_centers_xy_px is None else result.visible_centers_xy_px.copy())
+    full_area = (np.where(particles['touches_edge'], np.nan, particles['area_px']*original_pixel**2)
+                 if result.full_segmented_area_m2 is None else result.full_segmented_area_m2.copy())
+    annotated = []
+    for index, particle in enumerate(particles):
+        candidate = matches.get(int(particle['id']))
+        if candidate is not None and candidate not in duplicate:
+            complete = context.particles[candidate-1]
+            target = complete.copy()
+            target['id'] = particle['id']
+            annotated.append(target)
+        if statuses[index] not in ('clipped', 'context_clipped'):
+            continue
+        if candidate is None:
+            statuses[index] = 'unmatched'
+        elif candidate in duplicate:
+            statuses[index] = 'ambiguous'
+        elif complete['touches_edge']:
+            statuses[index] = 'context_clipped'
+        else:
+            for axis in ('x', 'y'):
+                offset = float(complete[f'offset_{axis}_m'])
+                particle[f'offset_{axis}_m'] = offset
+                size = result.image.shape[1 if axis == 'x' else 0]
+                particle[f'center_{axis}_px'] = offset/original_pixel+size/2-.5
+            particle['circle_diameter_m'] = complete['circle_diameter_m']
+            particle['circle_diameter_px'] = complete['circle_diameter_m']/original_pixel
+            full_area[index] = complete['area_px']*context_pixel**2
+            statuses[index] = 'recovered'
+    metadata = dict(context_fov_m=context.fov_m, context_shape_px=list(context.image.shape),
+        original_fov_m=result.fov_m,
+        context_pixel_size_m=context_pixel, matching='foreground overlap, unique association',
+        original_to_context_id={str(key): value for key, value in matches.items() if value not in duplicate},
+        recovered_particle_ids=particles['id'][statuses == 'recovered'].tolist())
+    updated = replace(result, particles=particles, center_status=statuses,
+        visible_centers_xy_px=visible, full_segmented_area_m2=full_area,
+        context_metadata=result.context_metadata+(metadata,))
+    label_lookup = np.zeros(len(context.particles)+1, dtype=np.int32)
+    for original_id, candidate_id in matches.items():
+        if candidate_id not in duplicate:
+            label_lookup[candidate_id] = original_id
+    targets = replace(context, particles=np.asarray(annotated, dtype=PARTICLE_DTYPE),
+                      labels=label_lookup[context.labels])
+    return updated, targets

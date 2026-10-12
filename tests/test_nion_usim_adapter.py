@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -56,6 +57,34 @@ class _FakeAPI:
 
 
 class NionUSimAdapterTest(unittest.TestCase):
+    def test_failed_context_acquisition_restores_original_fov_and_profile(self):
+        api = _FakeAPI()
+        with NionUSimAdapter(api, image_size_px=48) as adapter:
+            adapter.acquire_haadf()
+            previous = adapter.get_last_scan_profile()
+            original = dict(api.hardware_source.current_parameters)
+            with mock.patch.object(api.hardware_source, 'record', side_effect=RuntimeError('camera failed')):
+                with self.assertRaises(RuntimeError):
+                    adapter.acquire_particle_context(fov_m=160e-9, reference_fov_m=80e-9,
+                        reference_shape_px=(32, 48))
+            self.assertEqual(api.hardware_source.current_parameters, original)
+            self.assertEqual(adapter.get_last_scan_profile(), previous)
+
+    def test_particle_context_restores_profile_and_last_primary_record(self):
+        api = _FakeAPI()
+        with NionUSimAdapter(api, image_size_px=48) as adapter:
+            adapter.acquire_haadf()
+            previous = adapter.get_last_scan_profile()
+            original = dict(api.hardware_source.current_parameters)
+            stage = adapter.get_stage_position()
+            image, fov = adapter.acquire_particle_context(fov_m=160e-9,
+                reference_fov_m=80e-9, reference_shape_px=(32, 48))
+            self.assertAlmostEqual(fov, 160e-9)
+            self.assertEqual(api.hardware_source.current_parameters, original)
+            self.assertEqual(adapter.get_last_scan_profile(), previous)
+            self.assertEqual(adapter.get_stage_position(), stage)
+            self.assertEqual(api.hardware_source.last_parameters['pixel_size'], (96, 96))
+
     def test_adapter_translates_si_units_to_usim_frame_parameters(self) -> None:
         api = _FakeAPI()
         adapter = NionUSimAdapter(

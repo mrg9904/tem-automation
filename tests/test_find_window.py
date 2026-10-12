@@ -3,7 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import numpy as np
-from algorithms.FindWindow import find_window_in_image, make_window_anchor
+from algorithms.FindWindow import find_window_in_image, make_window_anchor, subdivide_window
 
 
 def square_image(angle, center=(130., 122.), side=112., invert=False):
@@ -69,6 +69,32 @@ class FindWindowTest(unittest.TestCase):
         for image in (np.zeros(50), np.full((50, 50), np.nan), np.zeros((10, 10))):
             with self.assertRaises(ValueError):
                 find_window_in_image(image)
+
+    def test_subdivision_inset_coverage_and_serpentine_order(self):
+        result = find_window_in_image(square_image(60))
+        corners = result.corners_xy_px*54e-6/result.side_px
+        anchor = dict(corners_stage_xy_m=corners.tolist())
+        grid = subdivide_window(result, anchor)
+        np.testing.assert_allclose(grid.inner_size_m, [52e-6, 52e-6], atol=1e-20)
+        self.assertEqual(len(grid.cells), 25)
+        u = (corners[1]-corners[0])/54e-6
+        v = (corners[3]-corners[0])/54e-6
+        for index, cell in enumerate(grid.cells):
+            self.assertEqual(cell['id'], index+1)
+            np.testing.assert_allclose(cell['size_m'], [10.4e-6]*2, atol=1e-20)
+            local = (np.array(cell['corners_stage_xy_m'])-corners[0]) @ np.column_stack((u, v))
+            self.assertGreaterEqual(local.min(), 1e-6-1e-18)
+            self.assertLessEqual(local.max(), 53e-6+1e-18)
+            if index:
+                prior = grid.cells[index-1]
+                self.assertEqual(abs(cell['row']-prior['row'])+abs(cell['column']-prior['column']), 1)
+        with tempfile.TemporaryDirectory() as root:
+            grid.save(result, root)
+            self.assertTrue((Path(root)/'ronchigram_grid.png').is_file())
+            with np.load(Path(root)/'window_grid.npz', allow_pickle=False) as saved:
+                self.assertEqual(saved['centers_stage_xy_m'].shape, (25, 2))
+        with self.assertRaises(ValueError):
+            subdivide_window(result, anchor, inset_m=30e-6)
 
 
 if __name__ == '__main__':

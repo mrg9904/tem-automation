@@ -31,6 +31,7 @@ class AutofocusResult:
     converged: bool
     measurements: tuple[FocusMeasurement, ...]
     stop_reason: str = ""
+    mode: str = 'fine'
 
 
 @dataclass(frozen=True)
@@ -49,9 +50,19 @@ class AutofocusConfig:
     score_relative_tolerance: float = 0.01
     minimum_precision_m: float = 0.0
     minimum_score_span_fraction: float = 0.0
+    mode: str = 'fine'
+    coarse_precision_m: float = 100e-9
+
+    @classmethod
+    def coarse(cls, *, precision_m=100e-9, **kwargs):
+        """One frame per position and an absolute coarse precision target."""
+        kwargs.setdefault('frames_per_position', 1)
+        return cls(mode='coarse', coarse_precision_m=precision_m, **kwargs)
 
 
     def validate(self):
+        if self.mode not in ('coarse', 'fine') or not np.isfinite(self.coarse_precision_m) or self.coarse_precision_m <= 0:
+            raise ValueError('Invalid autofocus mode or coarse precision')
         if not np.isfinite(self.precision_fov_fraction) or self.precision_fov_fraction <= 0:
             raise ValueError("precision_fov_fraction must be positive")
         if not np.isfinite(self.initial_half_range_fov_fraction) or self.initial_half_range_fov_fraction <= 0:
@@ -127,6 +138,7 @@ def autofocus(
     *,
     config: AutofocusConfig = DEFAULT_AUTOFOCUS_CONFIG,
     metric: FocusMetric = tenengrad_score,
+    progress: Callable[[str], None] | None = None,
 ) -> AutofocusResult:
     """Run adaptive HAADF autofocus using the active profile FoV."""
     config.validate()
@@ -136,7 +148,8 @@ def autofocus(
     if not np.isfinite(fov_m) or fov_m <= 0:
         raise RuntimeError(f"Microscope returned an invalid FoV: {fov_m!r}")
 
-    target_precision_m = max(fov_m * config.precision_fov_fraction, config.minimum_precision_m)
+    target_precision_m = (config.coarse_precision_m if config.mode == 'coarse' else
+                          max(fov_m * config.precision_fov_fraction, config.minimum_precision_m))
     initial_half_range_m = (
         fov_m * config.initial_half_range_fov_fraction
     )
@@ -190,6 +203,8 @@ def autofocus(
             if bracket is not None:
                 lower, upper = max(lower, bracket[0]), min(upper, bracket[1])
             positions = np.linspace(lower, upper, config.points_per_round)
+            if progress is not None:
+                progress(f'Autofocus round {rounds}: searching {lower*1e9:.1f} to {upper*1e9:.1f} nm...')
             final_step_m = float(positions[1] - positions[0])
             round_results = [
                 evaluate(float(position))
@@ -260,4 +275,5 @@ def autofocus(
         converged=converged,
         measurements=tuple(measurements),
         stop_reason=stop_reason,
+        mode=config.mode,
     )

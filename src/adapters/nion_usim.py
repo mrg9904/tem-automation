@@ -153,6 +153,15 @@ class NionUSimAdapter:
         self._dwell_time_us = float(parameters['pixel_time_us'])
         return {'profile_index': index, 'parameters': dict(parameters)}
 
+    def set_display_tone(self, brightness: float, contrast: float):
+        """Persist display-only B&C in the selected uSim scan profile."""
+        if not np.isfinite([brightness, contrast]).all() or contrast <= 0:
+            raise ValueError('Invalid display brightness/contrast')
+        source = self._require_hardware_source()
+        parameters = dict(self._get_active_profile_frame_parameters())
+        parameters.update(usim_brightness=float(brightness), usim_contrast=float(contrast))
+        source.set_frame_parameters_for_profile_by_index(source.profile_index, parameters)
+
     def get_coordinate_transform(self):
         return ImageStageTransform(self.get_scan_rotation(), stage_direction=-1.)
 
@@ -203,6 +212,34 @@ class NionUSimAdapter:
         self._last_record_parameters = dict(frame_parameters)
         self._last_record_profile_index = int(hardware_source.profile_index)
         return data
+
+    def acquire_particle_context(self, *, fov_m, reference_fov_m, reference_shape_px):
+        """Acquire a concentric overview, restoring FoV/profile/record metadata.
+
+        Context resolution grows with FoV up to 1536 pixels, bounding the
+        simulator's depth-focus memory. Its actual pixel size is recorded.
+        """
+        if not np.isfinite([fov_m, reference_fov_m]).all() or fov_m <= reference_fov_m or reference_fov_m <= 0:
+            raise ValueError('Invalid particle context FoV')
+        source = self._require_hardware_source()
+        index = int(source.profile_index)
+        profile = self._get_active_profile_frame_parameters()
+        stage = self.get_stage_position()
+        record = getattr(self, '_last_record_parameters', None)
+        record_index = getattr(self, '_last_record_profile_index', None)
+        size = min(1536, max(32, round(max(reference_shape_px)*fov_m/reference_fov_m)))
+        try:
+            self.set_fov(fov_m)
+            actual = self.get_fov()
+            with self.acquisition_settings(image_size_px=size, dwell_time_us=self._dwell_time_us):
+                image = self.acquire_haadf()
+            if self.get_stage_position() != stage:
+                raise RuntimeError('Stage moved during particle context acquisition')
+            return image, actual
+        finally:
+            source.set_frame_parameters_for_profile_by_index(index, profile)
+            self._last_record_parameters = record
+            self._last_record_profile_index = record_index
 
     def _record_cancellable(self, source, parameters):
         pending = getattr(self, "_pending_record", None)

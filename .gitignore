@@ -27,3 +27,7 @@ src/scripts/roi_reference.npz
 
 src/scripts/roi_reference.json
 src/scripts/find_window_results/
+tests/find_window_results/
+src/scripts/find_thin_results/
+src/scripts/thin_workflow_results/
+tests/find_thin_results/

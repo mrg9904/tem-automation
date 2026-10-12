@@ -7,6 +7,24 @@ from typing import runtime_checkable
 
 import numpy as np
 import numpy.typing as npt
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class SpectrumImageCapture:
+    spectra: np.ndarray  # y, x, energy; may be a disk-backed memmap
+    energy_eV: np.ndarray
+    haadf: np.ndarray
+    fov_m: float
+    metadata: dict[str, Any]
+
+
+class SpectrumImagingMicroscope(Protocol):
+    def get_fov(self) -> float: ...
+    def set_effective_defocus(self, defocus_m: float) -> None: ...
+    def acquire_eels_spectrum_image(self, *, image_size_px: int, dwell_time_us: float,
+                                    output_path: Any, dispersion_eV: float,
+                                    energy_min_eV: float, energy_max_eV: float) -> SpectrumImageCapture: ...
 
 
 @runtime_checkable

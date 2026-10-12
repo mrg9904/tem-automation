@@ -8,6 +8,18 @@ from tests.fake_microscope import FakeMicroscope
 
 
 class AutofocusTest(unittest.TestCase):
+    def test_coarse_uses_absolute_100nm_precision_and_fewer_measurements(self):
+        coarse_microscope = FakeMicroscope(initial_defocus_m=-120e-9, best_defocus_m=65e-9)
+        fine_microscope = FakeMicroscope(initial_defocus_m=-120e-9, best_defocus_m=65e-9)
+        coarse = autofocus(coarse_microscope, config=AutofocusConfig.coarse())
+        fine = autofocus(fine_microscope)
+        self.assertEqual(coarse.mode, 'coarse')
+        self.assertTrue(coarse.converged)
+        self.assertAlmostEqual(coarse.target_precision_m, 100e-9)
+        self.assertLessEqual(abs(coarse.best_defocus_m-65e-9), 100e-9)
+        self.assertLess(len(coarse.measurements), len(fine.measurements))
+        self.assertEqual(AutofocusConfig.coarse().frames_per_position, 1)
+
     def test_autofocus_finds_known_best_focus(self) -> None:
         microscope = FakeMicroscope(
             initial_defocus_m=-120e-9,

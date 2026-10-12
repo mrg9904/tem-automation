@@ -204,3 +204,90 @@ def make_window_anchor(result, stage_positions_m, angular_offset_rad, angular_sc
         center_patch_error_m=float(np.linalg.norm(stages[0]-corners.mean(axis=0))),
         mapping='stage(u,v)=origin+u*U+v*V+u*v*UV; assumes sufficiently weak interior ray distortion',
         units='meters; stage targets use the acquisition device coordinate convention')
+
+
+@dataclass(frozen=True)
+class WindowSubdivision:
+    cells: tuple
+    inset_m: float
+    shape: tuple
+    inner_size_m: tuple
+
+    def save(self, result, directory):
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        metadata = dict(shape=self.shape, inset_m=self.inset_m,
+            inner_size_m=self.inner_size_m, order='serpentine from C1', cells=self.cells)
+        (directory/'window_grid.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+        np.savez_compressed(directory/'window_grid.npz',
+            centers_stage_xy_m=[c['center_stage_xy_m'] for c in self.cells],
+            corners_stage_xy_m=[c['corners_stage_xy_m'] for c in self.cells],
+            centers_xy_px=[c['center_xy_px'] for c in self.cells],
+            corners_xy_px=[c['corners_xy_px'] for c in self.cells],
+            metadata_json=np.asarray(json.dumps(metadata)))
+        base = directory/'ronchigram_window.png'
+        if not base.exists():
+            result.save(directory)
+        with Image.open(base) as source:
+            image = source.convert('RGB')
+        draw = ImageDraw.Draw(image)
+        font = ImageFont.load_default(size=max(12, min(result.image.shape)//50))
+        text = (f'{self.shape[0]}x{self.shape[1]} | inset {self.inset_m*1e6:.2f} um | '
+                f'usable {self.inner_size_m[0]*1e6:.2f} x {self.inner_size_m[1]*1e6:.2f} um')
+        position = (10, round(font.size*4.2))
+        bounds = draw.textbbox(position, text, font=font)
+        draw.rectangle((bounds[0]-5, bounds[1]-5, bounds[2]+5, bounds[3]+5), fill='black')
+        draw.text(position, text, font=font, fill='cyan')
+        for cell in self.cells:
+            corners = [tuple(p) for p in cell['corners_xy_px']]
+            draw.line(corners+[corners[0]], fill='cyan', width=2)
+            draw.text(tuple(cell['center_xy_px']), str(cell['id']), font=font,
+                      anchor='mm', fill='yellow', stroke_width=2, stroke_fill='black')
+        image.save(directory/'ronchigram_grid.png')
+        return directory/'ronchigram_grid.png'
+
+
+def subdivide_window(result, anchor, *, shape=(5, 5), inset_m=1e-6):
+    """Inset all four measured edges and divide in the window's own axes.
+
+    IDs follow a serpentine path from C1. Inset distances are perpendicular
+    to the physical edges. A distorted/non-square physical anchor is rejected.
+    54 um measured width yields 52 um usable width and 10.4 um cells.
+    """
+    if len(shape) != 2 or any(isinstance(n, bool) or not isinstance(n, (int, np.integer)) or n <= 0 for n in shape):
+        raise ValueError('shape must contain two positive integers')
+    if not np.isfinite(inset_m) or inset_m < 0:
+        raise ValueError('inset_m must be finite and nonnegative')
+    corners = np.asarray(anchor['corners_stage_xy_m'], dtype=float)
+    if corners.shape != (4, 2) or not np.isfinite(corners).all():
+        raise ValueError('Expected four calibrated Stage corners')
+    u, v = corners[1]-corners[0], corners[3]-corners[0]
+    width, height = np.linalg.norm(u), np.linalg.norm(v)
+    if min(width, height) <= 2*inset_m:
+        raise ValueError('Inset leaves no usable window')
+    if abs(np.dot(u, v)/(width*height)) > .02 or abs(width-height)/max(width, height) > .02 or np.linalg.norm(corners[2]-corners[0]-u-v) > .01*min(width, height):
+        raise ValueError('Physical window is distorted; rectangular subdivision requires a square anchor')
+    margin_u, margin_v = inset_m/width, inset_m/height
+    rows, columns = map(int, shape)
+    def interpolate(points, a, b):
+        return ((1-a)*(1-b)*points[0]+a*(1-b)*points[1]+
+                a*b*points[2]+(1-a)*b*points[3])
+    cells = []
+    for row in range(rows):
+        order = range(columns) if row % 2 == 0 else range(columns-1, -1, -1)
+        for column in order:
+            check_cancelled()
+            a0 = margin_u+column*(1-2*margin_u)/columns
+            a1 = margin_u+(column+1)*(1-2*margin_u)/columns
+            b0 = margin_v+row*(1-2*margin_v)/rows
+            b1 = margin_v+(row+1)*(1-2*margin_v)/rows
+            uv = [(a0, b0), (a1, b0), (a1, b1), (a0, b1)]
+            cells.append(dict(id=len(cells)+1, row=row, column=column,
+                center_stage_xy_m=interpolate(corners, (a0+a1)/2, (b0+b1)/2).tolist(),
+                corners_stage_xy_m=[interpolate(corners, a, b).tolist() for a, b in uv],
+                center_xy_px=interpolate(result.corners_xy_px, (a0+a1)/2, (b0+b1)/2).tolist(),
+                corners_xy_px=[interpolate(result.corners_xy_px, a, b).tolist() for a, b in uv],
+                size_m=[float((width-2*inset_m)/columns), float((height-2*inset_m)/rows)],
+                scan_rotation_rad=float(np.arctan2(-u[1], -u[0]))))
+    return WindowSubdivision(tuple(cells), float(inset_m), (rows, columns),
+                             (float(width-2*inset_m), float(height-2*inset_m)))

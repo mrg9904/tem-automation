@@ -64,6 +64,18 @@ class NionUSimRonchigramAdapter(NionUSimAdapter):
         names = ('C10', 'stage_z_m', 'stage_tilt_rad.x', 'stage_tilt_rad.y', 'beam_shift_m.x', 'beam_shift_m.y')
         return tuple(instrument.get_control_output(name) for name in names)
 
+    def prepare_window_scan(self, rotation_rad):
+        """Align scan axes with the window and compensate Stage Z for HAADF."""
+        if not np.isfinite(rotation_rad):
+            raise ValueError('Scan rotation must be finite')
+        source = self._require_hardware_source()
+        parameters = self._get_active_profile_frame_parameters()
+        parameters.update(rotation_rad=float(rotation_rad), center_nm=(0., 0.))
+        source.set_frame_parameters_for_profile_by_index(int(source.profile_index), parameters)
+        # Return the specimen to the scan plane instead of compensating Stage Z
+        # with a huge lens-defocus value (600 um in the window-finding view).
+        self._require_instrument().set_control_output('stage_z_m', 0.)
+
     def window_coordinates(self, points_xy_px):
         """Map fitted center/corners with the same ray model as mouse navigation.
 

@@ -8,11 +8,109 @@ from scripts import usim_find_particles
 import numpy as np
 
 from algorithms.FindParticles import (
-    FindParticlesConfig, find_particles, find_particles_in_image,
+    FindParticlesConfig, find_particles, find_particles_in_image, recover_particle_centers,
 )
 
 
 class FindParticlesTest(unittest.TestCase):
+    def test_edge_center_recovered_from_larger_image_can_be_outside_fov(self):
+        image = np.zeros((128, 128))
+        image[40:84, 80:124] = 5.
+        config = FindParticlesConfig(gaussian_sigma_px=0, threshold=1.)
+        original = find_particles_in_image(image[32:96, 32:96], fov_m=64e-9, config=config)
+        context = find_particles_in_image(image, fov_m=128e-9, config=config)
+        recovered, targets = recover_particle_centers(original, context)
+        self.assertEqual(recovered.center_statuses.tolist(), ['recovered'])
+        self.assertAlmostEqual(recovered.particles[0]['center_x_px'], 69.5)
+        self.assertAlmostEqual(recovered.particles[0]['offset_x_m'], 38e-9)
+        self.assertEqual(recovered.particles[0]['area_px'], original.particles[0]['area_px'])
+        self.assertAlmostEqual(recovered.full_segmented_area_m2[0], 44*44*1e-18)
+        self.assertEqual(targets.particles[0]['id'], original.particles[0]['id'])
+        self.assertTrue(recovered.particles[0]['touches_edge'])
+        np.testing.assert_allclose(recovered.visible_centers_xy_px[0], [55.5, 29.5])
+
+    def test_edge_recovery_wrapper_uses_context_and_preserves_primary_capture(self):
+        full = np.zeros((128, 128))
+        full[40:84, 80:124] = 5.
+        class Microscope:
+            fov = 64e-9
+            def get_fov(self): return self.fov
+            def acquire_haadf(self): return full[32:96, 32:96]
+            def acquire_particle_context(self, **kwargs):
+                self.request = kwargs
+                return full, 128e-9
+        microscope = Microscope()
+        with tempfile.TemporaryDirectory() as root:
+            result = find_particles(microscope, output_path=Path(root)/'particles.npz',
+                config=FindParticlesConfig(gaussian_sigma_px=0, threshold=1.))
+            self.assertTrue((Path(root)/'particles_context_01/haadf_annotated.png').is_file())
+            with np.load(Path(root)/'particles.npz', allow_pickle=False) as archive:
+                self.assertEqual(str(archive['center_status'][0]), 'recovered')
+                self.assertEqual(archive['image'].shape, (64, 64))
+        self.assertEqual(microscope.get_fov(), 64e-9)
+        self.assertEqual(microscope.request['reference_shape_px'], (64, 64))
+
+    def test_incomplete_context_does_not_claim_full_center(self):
+        config = FindParticlesConfig(gaussian_sigma_px=0, threshold=1.)
+        original = np.zeros((64, 64)); original[20:40, 50:] = 5
+        context = np.zeros((128, 128)); context[52:72, 82:] = 5
+        a = find_particles_in_image(original, fov_m=64e-9, config=config)
+        b = find_particles_in_image(context, fov_m=128e-9, config=config)
+        result, _ = recover_particle_centers(a, b)
+        self.assertEqual(result.center_statuses.tolist(), ['context_clipped'])
+        np.testing.assert_array_equal(result.particles, a.particles)
+
+    def test_ambiguous_context_does_not_assign_two_particles_the_same_center(self):
+        image = np.zeros((128, 128))
+        image[42:52, 82:120] = 5
+        image[72:82, 82:120] = 5
+        image[42:82, 112:120] = 5
+        config = FindParticlesConfig(gaussian_sigma_px=0, threshold=1.)
+        a = find_particles_in_image(image[32:96, 32:96], fov_m=64e-9, config=config)
+        b = find_particles_in_image(image, fov_m=128e-9, config=config)
+        result, _ = recover_particle_centers(a, b)
+        self.assertEqual(result.center_statuses.tolist(), ['ambiguous', 'ambiguous'])
+        np.testing.assert_array_equal(result.particles, a.particles)
+
+    def test_thin_particles_with_bright_particles_and_background_gradient(self):
+        from scipy import ndimage
+        y, x = np.mgrid[:256, :256]
+        rng = np.random.default_rng(2026)
+        background = .1+.15*x/256+.015*np.sin(y/18)
+        noise = rng.normal(0, .006, background.shape)
+        image = background+noise
+        image[(x-65)**2+(y-65)**2 < 14**2] += 5.
+        image[(x-185)**2+(y-160)**2 < 12**2] += .18
+        image[(x-80)**2+(y-200)**2 < 9**2] += .15
+        legacy = find_particles_in_image(image, fov_m=2e-6,
+            config=FindParticlesConfig(threshold_method='otsu'))
+        self.assertEqual(len(legacy.particles), 1)
+        for polarity in (1, -1):
+            result = find_particles_in_image(polarity*image, fov_m=2e-6,
+                config=FindParticlesConfig(bright_particles=polarity > 0))
+            self.assertEqual(len(result.particles), 3)
+            for cy, cx in ((65, 65), (160, 185), (200, 80)):
+                self.assertGreater(result.labels[cy, cx], 0)
+            self.assertEqual(result.segmentation_method, 'local_snr')
+            self.assertTrue(np.isfinite(result.noise_scale).all())
+        empty = find_particles_in_image(background+noise, fov_m=2e-6)
+        self.assertEqual(len(empty.particles), 0)
+
+    def test_local_snr_exposure_invariance_and_diagnostic_archive(self):
+        y, x = np.mgrid[:128, :128]
+        image = np.random.default_rng(12).normal(.2, .005, (128, 128))
+        image[(x-30)**2+(y-35)**2 < 8**2] += 4.
+        image[(x-85)**2+(y-80)**2 < 7**2] += .12
+        original = find_particles_in_image(image, fov_m=1e-6)
+        rescaled = find_particles_in_image(image*17+123, fov_m=1e-6)
+        np.testing.assert_array_equal(original.labels, rescaled.labels)
+        with tempfile.TemporaryDirectory() as root:
+            path = original.save(Path(root)/'particles.npz')
+            with np.load(path, allow_pickle=False) as archive:
+                self.assertEqual(str(archive['threshold_method']), 'local_snr')
+                np.testing.assert_array_equal(archive['background'], original.background)
+                np.testing.assert_array_equal(archive['noise_scale'], original.noise_scale)
+
     def test_centers_ids_and_rectangular_image_coordinates(self):
         image = np.zeros((40, 80), dtype=np.float32)
         image[5:10, 10:15] = 10
@@ -148,7 +246,7 @@ class FindParticlesTest(unittest.TestCase):
             self.assertEqual(len(runs), 2)
             for run in runs:
                 self.assertEqual({p.name for p in run.iterdir()},
-                    {'find_particles.npz', 'haadf.png', 'haadf_annotated.png'})
+        {'find_particles.npz', 'haadf.png', 'haadf_annotated.png', 'auto_bc.json'})
                 with np.load(run / 'find_particles.npz', allow_pickle=False) as data:
                     self.assertEqual(len(data['particles']), 1)
                     np.testing.assert_array_equal(data['image'], image)
