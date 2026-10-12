@@ -304,6 +304,39 @@ Those images and manual-label provenance are local artifacts. Preview results
 are not substitutes for validation on real specimens.
 # Automatic HAADF brightness and contrast
 
+## CIF-driven Kikuchi orientation and zone-axis finding
+
+Import `src/scripts/usim_find_zone.py` to acquire a 1000 ms, binning-2 Ronchigram
+at the current position and index it against the sample CIF. It does not change
+stage, focus or tilt, and does not read simulator orientation, particle rotations
+or precomputed theoretical patterns. `algorithms/FindZone.py` uses CIF geometry,
+paired Radon band hypotheses, plane-angle voting and refined geometric image
+matching. The gemmi dependency reads the CIF and its symmetry operations.
+
+`src/scripts/find_zone_results/<timestamp>/` contains raw/canonical images,
+background, isolated band contrast, mask, Radon image, detected bands, candidate
+templates and indexed centerlines, observed/model comparison panels, JSON/NPZ
+orientation candidates, and CSV/PNG zone tilt tables. Ascending canonical angular
+coordinates account for the detector's existing 180-degree display rotation.
+TX/TY calculations use the actual `R_y(TY) @ R_x(TX)` stage convention and the
+nonorthogonal CIF metric. Enumerated targets have binary indices 0/1 except [000].
+
+Multiple plausible orientations and proper Laue/Friedel-equivalent axis labels
+are retained. Correlation scores and a heuristic plausibility filter are not
+calibrated probabilities; a tentative/unindexed result is not a unique orientation.
+Tilts are recommendations, with no movement or assumed hardware tilt limits.
+The intensity model is geometric/illustrative; validation on simulated frames
+does not establish the same angular precision on experimental data.
+`tests/preview_find_zone.py --reuse-image` analyzes the saved real uSim frame and
+performs a separate orientation audit; truth is never supplied to FindZone.
+Orientation deduplication uses batched rotation traces, templates reuse detector
+rays and bounded reflection chunks, and refinement uses analytic rotation/width
+derivatives with shared residual/Jacobian caching. Candidate and Laue-equivalent
+solution counts are preserved. An additional nearest-zone diagnostic searches
+primitive signed indices up to 3, including [210], separately from the requested
+binary-index tilt table. `tests/benchmark_find_zone.py` supports saved-frame
+timing and isolated tilted captures with optional test-only geometric ROI tracking.
+
 Import `src/scripts/usim_thin_workflow.py` in Nion Swift to run the complete
 window -> first grid cell -> all detected particles -> ranked EELS thickness maps.
 After window calibration, Stage Z returns to zero without lens compensation.
@@ -325,6 +358,12 @@ warnings. English progress output includes the current particle and autofocus ro
 `thin_mask.png` shows the exact classified area: green thin, gray thick and red
 unquantified, without boundary labels obscuring thin pixels. The criterion is
 `t/lambda < 1`, not an absolute 100 nm thickness measurement.
+After ranking, `top_thin_regions/` records one broad local thin patch for each
+of the top three particles. The center maximizes distance to the thin-mask boundary;
+a conservative inscribed circle stays within that thin patch even when regions are
+connected by narrow bridges. Magenta circles and crosses mark the selections.
+`regions.json` and `regions.npz` save image centers, absolute stage positions and
+circle sizes for subsequent positioning, without requiring saved spectral cubes.
 
 `algorithms/AutoBC.py` chooses display limits without clipping any finite pixel
 inside the supplied particle footprint. FindThin and FindParticles exports use

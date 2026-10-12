@@ -6,7 +6,7 @@ import numpy as np
 from adapters.cancellation import check_cancelled, WorkflowCancelled
 from algorithms.Zoom2Fit import zoom_to_fit
 from algorithms.autofocus import autofocus, AutofocusConfig
-from algorithms.FindThin import find_thin, FindThinConfig
+from algorithms.FindThin import find_thin, FindThinConfig, save_top_thin_regions
 from algorithms.AutoBC import auto_bc
 from scripts.common import write_json
 
@@ -128,4 +128,7 @@ def map_particles(microscope, particles, center_statuses, reference_stage_xy_m, 
         save_ranking(directory, report)
     progress(f"Mapping finished: {len(report['ranking'])}/{len(particles)} particles mapped. "
              'Saving thin-area ranking from highest to lowest...')
+    progress('Selecting and marking broad thin regions in the top three particles...')
+    report['top_thin_regions'] = save_top_thin_regions(directory, report['ranking'])
+    save_ranking(directory, report)
     return report

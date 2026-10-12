@@ -39,14 +39,16 @@ class NionUSimRonchigramAdapter(NionUSimAdapter):
         self.set_defocus(0.)
         instrument.probe_position = Geometry.FloatPoint(.5, .5)
 
-    def acquire_ronchigram(self):
+    def acquire_ronchigram(self, *, exposure_ms=100., binning=1):
         """Record a full detector frame; scan FoV never substitutes for calibration."""
         source = self._camera_source
         if source is None:
             raise RuntimeError('Adapter is not connected')
         self._wait_until_recording_finishes(source)
         parameters = dict(source.get_frame_parameters())
-        parameters.update(binning=1, exposure_ms=100.)
+        if not np.isfinite(exposure_ms) or exposure_ms <= 0 or binning not in (1, 2, 4):
+            raise ValueError('Invalid Ronchigram exposure or binning')
+        parameters.update(binning=binning, exposure_ms=float(exposure_ms))
         parameters.pop('readout_area', None)
         frames = self._record_cancellable(source, parameters)
         self._wait_until_recording_finishes(source)
@@ -57,7 +59,22 @@ class NionUSimRonchigramAdapter(NionUSimAdapter):
         self._capture_stage = self.get_stage_position()
         self._capture_controls = self._view_controls()
         self._capture_calibrations = frame.dimensional_calibrations
+        self._capture_kikuchi_enabled = frame.metadata.get('kikuchi_simulation', {}).get('kikuchi_enabled', True)
         return np.asarray(frame.data, dtype=np.float32).copy()
+
+    def zone_capture_parameters(self):
+        """Only instrument calibration and phase; no simulated orientation truth."""
+        calibration = self._capture_calibrations
+        if len(calibration) != 2 or any(item.units != 'rad' for item in calibration):
+            raise RuntimeError('FindZone requires angular detector calibration in radians')
+        instrument = self._native_instrument()
+        sample = instrument.scan_data_generator.sample
+        return dict(offset_yx_rad=[item.offset for item in calibration],
+            scale_yx_rad=[item.scale for item in calibration], voltage_v=instrument.GetVal('EHT'),
+            stage_tilt_xy_rad=[instrument.GetVal2D('stage_tilt_rad').x, instrument.GetVal2D('stage_tilt_rad').y],
+            stage_xy_m=list(self.get_stage_position()), stage_z_m=instrument.GetVal('stage_z_m'),
+            defocus_m=self.get_defocus(), kikuchi_enabled=self._capture_kikuchi_enabled,
+            cif_path=getattr(sample, 'crystal_cif_path', None))
 
     def _view_controls(self):
         instrument = self._require_instrument()

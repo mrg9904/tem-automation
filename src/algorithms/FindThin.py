@@ -22,6 +22,80 @@ def complete_particle_footprint(labels, particle_id):
     return selected | (ndimage.binary_fill_holes(selected) & (labels > 0))
 
 
+def select_large_thin_region(result):
+    """Select the widest local thin patch, independently of connectivity.
+
+    The largest interior distance locates the center of an inscribed disk.
+    This avoids a connected ring's centroid landing in its thick interior.
+    Radius is conservative with respect to square pixel boundaries.
+    """
+    mask = result.thin_mask
+    if not mask.any():
+        return None
+    distance = ndimage.distance_transform_edt(np.pad(mask, 1))[1:-1, 1:-1]
+    y, x = np.unravel_index(np.argmax(distance), distance.shape)
+    radius = max(.25, float(distance[y, x])-np.sqrt(.5))
+    pixel_m = result.fov_m/max(mask.shape)
+    offset = (np.array([x, y])+.5-np.asarray(mask.shape[::-1])/2)*pixel_m
+    record = dict(center_xy_px=[int(x), int(y)], offset_xy_m=offset.tolist(),
+        radius_px=radius, radius_m=radius*pixel_m, diameter_m=2*radius*pixel_m,
+        selection_method='largest inscribed disk in the thin mask; center stays inside thin area',
+        local_t_over_lambda=float(result.t_over_lambda[y, x]))
+    if 'stage_xy_m' in result.metadata and 'image_to_stage_matrix' in result.metadata:
+        record['center_stage_xy_m'] = (np.asarray(result.metadata['stage_xy_m'])+
+            np.asarray(result.metadata['image_to_stage_matrix'])@offset).tolist()
+    return record
+
+
+def save_top_thin_regions(directory, ranking, *, count=3):
+    """Record and annotate one broad thin patch for each top-ranked particle."""
+    directory = Path(directory)
+    target = directory/'top_thin_regions'
+    target.mkdir(parents=True, exist_ok=True)
+    records = []
+    for entry in ranking[:count]:
+        source = directory/entry['directory']/'thickness'
+        if not (source/'find_thin.npz').exists():
+            continue
+        with np.load(source/'find_thin.npz', allow_pickle=False) as saved:
+            summary = json.loads(str(saved['metadata_json']))
+            result = FindThinResult(saved['t_over_lambda'], saved['particle_mask'], saved['thin_mask'],
+                saved['valid_mask'], saved['thin_labels'], saved['total_counts'], saved['zlp_counts'],
+                saved['haadf'], saved['energy_eV'], float(saved['fov_m']),
+                FindThinConfig(**summary['config']), summary['acquisition'])
+            region = select_large_thin_region(result)
+            if region is None:
+                records.append(dict(rank=entry['rank'], particle_id=entry['particle_id'], status='no_thin_region'))
+                continue
+            record = dict(region, rank=entry['rank'], particle_id=entry['particle_id'],
+                          thin_area_percent=entry['thin_area_percent'])
+            stem = f"rank_{entry['rank']:02d}_particle_{entry['particle_id']:04d}"
+            with Image.open(source/'haadf_thin_annotated.png') as image:
+                image = image.convert('RGB')
+            scale_x, scale_y = image.width/result.haadf.shape[1], image.height/result.haadf.shape[0]
+            x, y = record['center_xy_px']
+            x, y = (x+.5)*scale_x-.5, (y+.5)*scale_y-.5
+            rx, ry = record['radius_px']*scale_x, record['radius_px']*scale_y
+            draw = ImageDraw.Draw(image)
+            draw.ellipse((x-rx, y-ry, x+rx, y+ry), outline='magenta', width=3)
+            draw.line((x-5, y, x+5, y), fill='magenta', width=2)
+            draw.line((x, y-5, x, y+5), fill='magenta', width=2)
+            draw.text((8, image.height-24), f"Rank #{entry['rank']} / particle #{entry['particle_id']}: selected thin patch",
+                fill='magenta', font=ImageFont.load_default(size=14), stroke_width=1, stroke_fill='black')
+            image.save(target/(stem+'.png'))
+            record['annotated_image'] = str(Path('top_thin_regions')/(stem+'.png'))
+            (target/(stem+'.json')).write_text(json.dumps(record, indent=2), encoding='utf-8')
+            records.append(record)
+    (target/'regions.json').write_text(json.dumps(records, indent=2), encoding='utf-8')
+    selected = [record for record in records if 'center_xy_px' in record]
+    np.savez_compressed(target/'regions.npz',
+        particle_id=np.array([record['particle_id'] for record in selected], dtype=np.int64),
+        center_xy_px=np.asarray([record['center_xy_px'] for record in selected]).reshape(-1, 2),
+        center_stage_xy_m=np.asarray([record.get('center_stage_xy_m', [np.nan, np.nan]) for record in selected]).reshape(-1, 2),
+        radius_m=np.asarray([record['radius_m'] for record in selected]))
+    return records
+
+
 @dataclass(frozen=True)
 class FindThinConfig:
     image_size_px: int = 128

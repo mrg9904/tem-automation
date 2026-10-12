@@ -31,3 +31,5 @@ tests/find_window_results/
 src/scripts/find_thin_results/
 src/scripts/thin_workflow_results/
 tests/find_thin_results/
+src/scripts/find_zone_results/
+tests/find_zone_results/

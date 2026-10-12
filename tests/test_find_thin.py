@@ -2,11 +2,43 @@ from pathlib import Path
 import tempfile
 import unittest
 import numpy as np
-from algorithms.FindThin import FindThinConfig, analyze_thin, find_thin, complete_particle_footprint
+from algorithms.FindThin import (FindThinConfig, analyze_thin, find_thin, complete_particle_footprint,
+                                 select_large_thin_region, save_top_thin_regions)
 from adapters.base import SpectrumImageCapture
 
 
 class FindThinTest(unittest.TestCase):
+    def test_broad_patch_selection_ignores_a_narrow_connected_bridge(self):
+        from dataclasses import replace
+        cube, energy, mask, _ = self.cube()
+        result = analyze_thin(cube, energy, particle_mask=mask, fov_m=200e-9)
+        thin = np.zeros((40, 40), bool)
+        thin[3:19, 3:19] = True
+        thin[8:14, 27:35] = True
+        thin[10, 18:28] = True
+        selected = select_large_thin_region(replace(result, thin_mask=thin,
+            t_over_lambda=np.full(thin.shape, .5), fov_m=400e-9,
+            metadata={'stage_xy_m': [1e-6, 2e-6], 'image_to_stage_matrix': [[-1, 0], [0, -1]]}))
+        x, y = selected['center_xy_px']
+        self.assertTrue(3 < x < 19 and 3 < y < 19)
+        yy, xx = np.indices(thin.shape)
+        disk = (xx-x)**2+(yy-y)**2 <= selected['radius_px']**2
+        self.assertTrue(thin[disk].all())
+        np.testing.assert_allclose(selected['center_stage_xy_m'],
+                                   np.array([1e-6, 2e-6])-selected['offset_xy_m'])
+
+    def test_top_region_saved_using_derived_arrays_without_spectrum_cube(self):
+        cube, energy, mask, _ = self.cube()
+        result = analyze_thin(cube, energy, particle_mask=mask, fov_m=200e-9)
+        with tempfile.TemporaryDirectory() as root:
+            result.save(Path(root)/'particles/particle_0001/thickness')
+            records = save_top_thin_regions(root, [dict(rank=1, particle_id=1,
+                thin_area_percent=50., directory='particles/particle_0001')])
+            self.assertEqual(records[0]['particle_id'], 1)
+            self.assertTrue((Path(root)/records[0]['annotated_image']).exists())
+            self.assertTrue((Path(root)/'top_thin_regions/regions.npz').exists())
+            self.assertFalse((Path(root)/'particles/particle_0001/thickness/eels_spectrum_image.npy').exists())
+
     def test_nested_core_is_in_denominator_but_background_pore_is_not(self):
         labels = np.zeros((30, 30), dtype=int)
         labels[4:26, 4:26] = 1
